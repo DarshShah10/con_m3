@@ -24,7 +24,9 @@ class ReasoningAgent:
     """
 
     def __init__(self, config: Dict[str, Any]):
-        self.client = openai.OpenAI(api_key=config["api_key"])
+        
+        api_key = config.get("openai_api_key") or config.get("api_key")
+        self.client = openai.OpenAI(api_key=api_key)
         self.model = config.get("model", "gpt-4o")
         self.max_retries = config.get("max_retries", 3)
 

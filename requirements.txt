@@ -3,7 +3,7 @@ openai
 qdrant-client
 neo4j
 pydantic
-numpy==1.26.4
+numpy
 moviepy==1.0.3
 pillow
 
@@ -20,7 +20,6 @@ torchaudio
 
 # Audio & Speech (SOTA)
 pyannote.audio==3.1.1
-wespeaker
 openai-whisper
 pydub
 scipy
