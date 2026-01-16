@@ -205,3 +205,56 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# --------------------
+# Virtual Environments
+# --------------------
+venv/
+.venv/
+env/
+
+# --------------------
+# Python cache
+# --------------------
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --------------------
+# Logs & outputs
+# --------------------
+logs/
+*.log
+out*
+results/
+intermediate_outputs/
+
+# --------------------
+# Data & artifacts
+# --------------------
+videos/
+memory_graphs/
+models/
+idl/
+speakerlab/
+
+# --------------------
+# Datasets / generated files
+# --------------------
+data.jsonl
+
+# --------------------
+# Secrets / configs
+# --------------------
+configs/api_config.json
+
+# --------------------
+# OS / Editor junk
+# --------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.pt
+
