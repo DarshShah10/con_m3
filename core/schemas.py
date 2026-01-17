@@ -1,17 +1,29 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Union
 import uuid
+from enum import Enum
+
+class EntityType(Enum):
+    PERSON = "person"
+    OBJECT = "object"
+    VEHICLE = "vehicle"
+    TEXT = "text"
+    LOCATION = "location"
+    POV = "pov_user"
+
+class MemoryType(Enum):
+    SEMANTIC = "semantic"
+    EPISODIC = "episodic"
+    PROCEDURAL = "procedural"
 
 @dataclass(kw_only=True)
 class LinkedText:
-    """Text found specifically INSIDE an object."""
     content: str
     confidence: float
     bbox_relative: List[int]
 
 @dataclass(kw_only=True)
 class DetectedObject:
-    """A physical entity found in the frame."""
     label: str
     confidence: float
     bbox: List[int]
@@ -19,7 +31,6 @@ class DetectedObject:
 
 @dataclass(kw_only=True)
 class HierarchicalFrameObservation:
-    """Master container for a single moment."""
     video_id: str
     clip_id: int
     ts_ms: int
@@ -28,7 +39,6 @@ class HierarchicalFrameObservation:
     clip_embedding: Optional[List[float]] = None
     obs_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
-# --- Legacy Schemas (Required for Identity/Memory) ---
 @dataclass(kw_only=True)
 class FaceObservation:
     video_id: str
@@ -58,7 +68,7 @@ class VoiceObservation:
 class MemoryNode:
     video_id: str
     content: str
-    mem_type: str
+    mem_type: Union[str, MemoryType] # Robust typing
     clip_id: int
     mem_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     embedding: Optional[List[float]] = None
@@ -66,7 +76,6 @@ class MemoryNode:
 
 @dataclass(kw_only=True)
 class DialogueLine:
-    """Structured dialogue linked to an entity."""
     video_id: str
     clip_id: int
     entity_id: str
@@ -78,7 +87,7 @@ class DialogueLine:
 @dataclass(kw_only=True)
 class GlobalEntity:
     entity_id: str
-    entity_type: "EntityType"
+    entity_type: EntityType
     video_id: str
     
     # Track stats to determine if this is the Body Cam user
@@ -87,17 +96,3 @@ class GlobalEntity:
     
     face_embeddings: List[List[float]] = field(default_factory=list)
     voice_embeddings: List[List[float]] = field(default_factory=list)
-
-from enum import Enum
-class EntityType(Enum):
-    PERSON = "person"
-    OBJECT = "object"
-    VEHICLE = "vehicle"
-    TEXT = "text"
-    LOCATION = "location"
-    POV = "pov_user"
-
-class MemoryType(Enum):
-    SEMANTIC = "semantic"
-    EPISODIC = "episodic"
-    PROCEDURAL = "procedural"

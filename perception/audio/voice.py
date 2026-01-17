@@ -1,116 +1,124 @@
-import io
 import os
 import torch
 import logging
 import numpy as np
-from typing import List, Dict, Any, Union
+import whisperx
+import gc
+from typing import List, Dict, Any
 from pydub import AudioSegment
-import whisper
 from speechbrain.inference.speaker import EncoderClassifier
-from sklearn.cluster import AgglomerativeClustering
-from conclave.core.schemas import VoiceObservation
+from conclave.core.schemas import DialogueLine
 
-logger = logging.getLogger("Conclave.Audio.Voice")
+logger = logging.getLogger("Conclave.Audio")
 
-class VoiceProcessor:
+class GlobalAudioPipeline:
+    """
+    Simpler, Better, Faster.
+    Processes the ENTIRE audio track at once before video processing starts.
+    
+    Advantages:
+    1. No cut-off sentences (Global context).
+    2. Consistent Speaker IDs (Diarization runs on full file).
+    3. Better Embeddings (We can average vectors per speaker).
+    """
     def __init__(self, config: Dict[str, Any]):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.min_duration = 0.5
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.hf_token = config.get("hf_token") # Required for Diarization
         
-        logger.info(f"🎤 Loading SOTA Audio Stack on {self.device}...")
-
-        # 1. VAD (Silero) - Detects WHEN speech happens
-        try:
-            self.vad_model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                trust_repo=True
-            )
-            self.vad_model.to(self.device)
-            self.get_speech_timestamps = utils[0]
-        except Exception as e:
-            logger.error(f"Failed to load VAD: {e}")
-            raise e
-
-        # 2. Speaker Embedding (SpeechBrain) - Detects WHO is speaking
-        try:
-            self.speaker_model = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": str(self.device)}
-            )
-        except Exception as e:
-            logger.error(f"Failed to load SpeechBrain: {e}")
-            raise e
-
-        # 3. ASR (Whisper) - Detects WHAT is said
-        # using 'small.en' is faster/better than base for dialogue
-        self.asr_model = whisper.load_model("small.en", device=self.device)
-
-    def process_clip_audio(self, audio_bytes: bytes, video_id: str, clip_id: int) -> List[VoiceObservation]:
-        if not audio_bytes: return []
+        logger.info(f"🎤 Loading WhisperX Pipeline on {self.device}...")
+        self.model = whisperx.load_model("large-v2", self.device, compute_type="float16" if self.device=="cuda" else "int8")
+        self.align_model, self.align_meta = whisperx.load_align_model(language_code="en", device=self.device)
         
-        # Convert raw bytes to Tensor for VAD
-        try:
-            audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-            wav_data = np.array(audio.set_frame_rate(16000).set_channels(1).get_array_of_samples())
-            wav_float = wav_data.astype(np.float32) / 32768.0
-            wav_tensor = torch.from_numpy(wav_float).to(self.device)
-        except Exception:
-            return []
+        # Diarization (Who is speaking?)
+        self.diarize_model = None
+        if self.hf_token:
+            self.diarize_model = whisperx.DiarizationPipeline(use_auth_token=self.hf_token, device=self.device)
+        else:
+            logger.warning("⚠️ No HuggingFace Token! Speaker IDs will not be generated.")
 
-        # 1. Get precise timestamps
-        try:
-            timestamps = self.get_speech_timestamps(
-                wav_tensor, self.vad_model, sampling_rate=16000, min_speech_duration_ms=500
-            )
-        except: return []
-        
-        if not timestamps: return []
+        # Embedding (For linking to Identity System)
+        self.speaker_encoder = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": self.device}
+        )
 
-        observations = []
+    def process_full_video(self, audio_path: str, video_id: str) -> Dict[str, Any]:
+        """
+        Returns:
+        1. 'timeline': List of dialogue lines with timestamps.
+        2. 'speaker_embeddings': Dict mapping 'SPEAKER_01' -> [Vector]
+        """
+        logger.info("⏳ Starting Global Audio Analysis (This may take a moment)...")
         
-        # 2. Process each speech segment
-        # Using a fixed temp file name pattern to avoid accumulation
-        temp_path = f"temp_seg_{video_id}_{clip_id}.wav"
+        # 1. Transcribe
+        result = self.model.transcribe(audio_path, batch_size=16)
         
-        for ts in timestamps:
-            start_ms = int(ts['start'] / 16000 * 1000)
-            end_ms = int(ts['end'] / 16000 * 1000)
+        # 2. Align (Fix timestamps)
+        result = whisperx.align(result["segments"], self.align_model, self.align_meta, audio_path, self.device, return_char_alignments=False)
+        
+        # 3. Diarize (Assign Speaker Labels)
+        if self.diarize_model:
+            diarize_segments = self.diarize_model(audio_path)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+        
+        # 4. Process Results & Generate Embeddings
+        timeline = []
+        speaker_samples = {} # Store audio segments to average embeddings later
+        
+        # Load audio for embedding extraction
+        full_audio = AudioSegment.from_file(audio_path)
+
+        for seg in result["segments"]:
+            start = seg["start"]
+            end = seg["end"]
+            text = seg["text"].strip()
+            speaker = seg.get("speaker", "UNKNOWN")
             
-            # Extract segment audio
-            segment = audio[start_ms:end_ms]
-            
-            # Export to temp file for libraries that need file path
-            segment.export(temp_path, format="wav")
+            if len(text) < 2: continue
 
+            # Add to timeline
+            timeline.append(DialogueLine(
+                video_id=video_id,
+                clip_id=int(start // 30), # Approximate clip bucket
+                entity_id=speaker,        # Temporary ID (SPEAKER_01), resolved later
+                text=text,
+                start_ts=int(start * 1000),
+                end_ts=int(end * 1000),
+                confidence=0.99
+            ))
+
+            # Collect sample for this speaker (if we haven't processed them yet)
+            # We take the longest segment for the best voice print
+            duration = end - start
+            if speaker != "UNKNOWN" and duration > 1.0:
+                if speaker not in speaker_samples:
+                    speaker_samples[speaker] = (start, end, duration)
+                elif duration > speaker_samples[speaker][2]:
+                    speaker_samples[speaker] = (start, end, duration)
+
+        # 5. Generate Canonical Embeddings per Speaker
+        speaker_embeddings = {}
+        for spk, (s, e, _) in speaker_samples.items():
             try:
-                # A. Get Voice Fingerprint (Who?)
-                signal = self.speaker_model.load_audio(temp_path)
-                embedding = self.speaker_model.encode_batch(signal.unsqueeze(0)).squeeze().cpu().numpy()
-                norm_emb = (embedding / (np.linalg.norm(embedding) + 1e-6)).tolist()
+                # Extract snippet
+                chunk_path = f"temp_{video_id}_{spk}.wav"
+                chunk = full_audio[int(s*1000):int(e*1000)]
+                chunk.export(chunk_path, format="wav")
+                
+                # Embed
+                signal = self.speaker_encoder.load_audio(chunk_path)
+                emb = self.speaker_encoder.encode_batch(signal.unsqueeze(0)).squeeze().cpu().numpy()
+                norm_emb = (emb / (np.linalg.norm(emb) + 1e-6)).tolist()
+                
+                speaker_embeddings[spk] = norm_emb
+                
+                if os.path.exists(chunk_path): os.remove(chunk_path)
+            except Exception as ex:
+                logger.warning(f"Failed to embed {spk}: {ex}")
 
-                # B. Get Text (What?)
-                # We use strict timestamp decoding for accuracy
-                transcription = self.asr_model.transcribe(
-                    temp_path, fp16=(self.device.type == "cuda")
-                )['text'].strip()
-
-                if transcription:
-                    obs = VoiceObservation(
-                        video_id=video_id,
-                        clip_id=clip_id,
-                        ts_ms=start_ms,
-                        embedding=norm_emb,
-                        asr_text=transcription,
-                        start_sec=start_ms/1000.0,
-                        end_sec=end_ms/1000.0
-                    )
-                    observations.append(obs)
-
-            except Exception as e:
-                logger.warning(f"Audio processing error: {e}")
-            finally:
-                if os.path.exists(temp_path): os.remove(temp_path)
-
-        return observations
+        # Cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        logger.info(f"✅ Audio Complete. Found {len(speaker_embeddings)} unique speakers.")
+        return {"timeline": timeline, "embeddings": speaker_embeddings}

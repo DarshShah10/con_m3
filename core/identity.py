@@ -10,59 +10,69 @@ logger = logging.getLogger("Conclave.Identity")
 
 class IdentityManager:
     """
-    🔥 UNIFIED IDENTITY RESOLUTION SYSTEM 🔥
-    Merges logic from identity.py and identity_resolver.py into one canonical class.
-    Handles:
-    - Face/Voice resolution via vector similarity
-    - Co-occurrence-based identity linking
-    - Deep merge operations (Neo4j + Qdrant historical retagging)
-    - Canonical entity index for fast lookups
+    Robust Identity Resolution System.
+    
+    Key Features:
+    1. Persistent Aliasing: Loads merges from Graph on startup.
+    2. Non-Destructive Merging: Retains old nodes as 'tombstones' for audit.
+    3. Canonical Resolution: Always returns the primary ID, even for merged entities.
     """
     
     def __init__(self, vector_store: VectorStore, graph_store: GraphStore, config: Dict[str, Any]):
-        """
-        SOTA Identity Resolution System with Deep Refactoring capabilities.
-        """
         self.vector_store = vector_store
         self.graph_store = graph_store
         
-        # Configuration Thresholds
-        self.face_threshold = config.get("face_match_threshold", 0.70) # Lowered for bodycam
-        self.voice_threshold = config.get("voice_match_threshold", 0.75) # Lowered for bodycam
-        self.co_occurrence_threshold = config.get("min_co_occurrences_to_merge", 3)
-        
-        # 🔥 UNIFIED: Canonical Mapping (merged from IdentityResolver)
-        # entity_id -> { 'type': ..., 'alias': ..., 'canonical_id': ... }
-        self.entity_index: Dict[str, Dict[str, Any]] = {}
+        # Configuration
+        self.face_threshold = config.get("face_match_threshold", 0.65)
+        self.voice_threshold = config.get("voice_match_threshold", 0.70)
         
         self.collections = {
             "face": "face_memories",
             "voice": "voice_memories"
         }
         
-        # Local cache of stats for the POV heuristic
-        # entity_id -> {'voice': 0, 'face': 0}
-        self.entity_stats = {}
+        # Identity Cache: { "alias_id": "canonical_id" }
+        self._alias_map: Dict[str, str] = {}
+        
+        # Load existing aliases from the graph (Persistence)
+        self._load_alias_map()
 
-    def _generate_entity_id(self, prefix: str = "ent") -> str:
-        """Generates a new deterministic entity ID."""
-        return f"{prefix}_{uuid.uuid4().hex[:12]}"
+    def _load_alias_map(self):
+        """Rehydrate the alias map from Neo4j to ensure state persists across restarts."""
+        query = """
+        MATCH (alias:Entity)-[:MERGED_INTO]->(canonical:Entity)
+        RETURN alias.id as alias, canonical.id as canonical
+        """
+        try:
+            results = self.graph_store.run_query(query)
+            count = 0
+            for r in results:
+                self._alias_map[r['alias']] = r['canonical']
+                count += 1
+            if count > 0:
+                logger.info(f"♻️  Restored {count} identity aliases from Graph.")
+        except Exception as e:
+            logger.warning(f"Could not load aliases on init (Graph might be empty): {e}")
 
     def get_canonical_id(self, entity_id: str) -> str:
-        """
-        🔥 MERGED: From IdentityResolver
-        Resolves aliased IDs to their canonical form.
-        In production multi-agent systems, this prevents identity fragmentation.
-        """
-        if entity_id in self.entity_index:
-            return self.entity_index[entity_id].get("canonical_id", entity_id)
-        return entity_id
+        """Recursive lookup to find the true ID of an entity."""
+        # Prevent infinite loops with a depth limit
+        depth = 0
+        curr = entity_id
+        while curr in self._alias_map and depth < 10:
+            curr = self._alias_map[curr]
+            depth += 1
+        return curr
+
+    def _generate_entity_id(self, prefix: str = "ent") -> str:
+        return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
     def resolve_face(self, obs: FaceObservation) -> str:
         """
-        Alignment: Logic to resolve face identity before ingestion.
-        Uses vector similarity search to match against existing entities.
+        Finds the best matching face or creates a new one.
+        Returns the CANONICAL ID.
         """
+        # 1. Vector Search
         results = self.vector_store.search(
             collection=self.collections["face"],
             vector=obs.embedding,
@@ -70,32 +80,29 @@ class IdentityManager:
             limit=1
         )
         
+        matched_id = None
         if results and results[0].score >= self.face_threshold:
-            matched_id = results[0].payload.get("entity_id")
-            # Resolve to canonical ID if aliased
-            obs.entity_id = self.get_canonical_id(matched_id)
-            logger.info(f"Resolved Face {obs.obs_id[:8]} -> Existing Entity {obs.entity_id} (score: {results[0].score:.3f})")
-        else:
-            obs.entity_id = self._generate_entity_id("ent_face")
-            logger.info(f"New Face Detected. Created Entity {obs.entity_id}")
-            self.graph_store.create_entity_node(obs.entity_id, EntityType.PERSON.value, obs.video_id)
-            # Register in canonical index
-            self.entity_index[obs.entity_id] = {
-                "type": EntityType.PERSON.value,
-                "canonical_id": obs.entity_id,
-                "video_id": obs.video_id
-            }
+            raw_id = results[0].payload.get("entity_id")
+            matched_id = self.get_canonical_id(raw_id)
+            logger.info(f"👤 Face matched: {matched_id} (Score: {results[0].score:.2f})")
         
-        # Update Stats
-        self._update_stats(obs.entity_id, "face")
+        if matched_id:
+            obs.entity_id = matched_id
+        else:
+            # Create new Entity
+            new_id = self._generate_entity_id("ent_face")
+            self.graph_store.create_entity_node(new_id, EntityType.PERSON.value, obs.video_id)
+            obs.entity_id = new_id
+            logger.info(f"👤 New Face detected: {new_id}")
 
         return obs.entity_id
 
     def resolve_voice(self, obs: VoiceObservation) -> str:
         """
-        Alignment: Logic to resolve voice identity via vectors or co-occurrence.
-        Falls back to single-person heuristic if no vector match found.
+        Finds the best matching voice or creates a new one.
+        Returns the CANONICAL ID.
         """
+        # 1. Vector Search
         results = self.vector_store.search(
             collection=self.collections["voice"],
             vector=obs.embedding,
@@ -103,35 +110,33 @@ class IdentityManager:
             limit=1
         )
         
+        matched_id = None
         if results and results[0].score >= self.voice_threshold:
-            matched_id = results[0].payload.get("entity_id")
-            # Resolve to canonical ID if aliased
-            obs.entity_id = self.get_canonical_id(matched_id)
-            logger.info(f"Resolved Voice {obs.obs_id[:8]} -> Existing Entity {obs.entity_id} (score: {results[0].score:.3f})")
+            raw_id = results[0].payload.get("entity_id")
+            matched_id = self.get_canonical_id(raw_id)
+            logger.info(f"🎙️ Voice matched: {matched_id} (Score: {results[0].score:.2f})")
+        
+        if matched_id:
+            obs.entity_id = matched_id
         else:
-            # Fallback to co-occurrence heuristic if single person visible
-            entity_id = f"ent_voice_{uuid.uuid4().hex[:8]}"
-            self.graph_store.create_entity_node(entity_id, EntityType.PERSON.value, obs.video_id)
-            obs.entity_id = entity_id
-            self._update_stats(entity_id, "voice")
+            # Fallback: Create new Voice Entity
+            new_id = self._generate_entity_id("ent_voice")
+            self.graph_store.create_entity_node(new_id, EntityType.PERSON.value, obs.video_id)
+            obs.entity_id = new_id
+            logger.info(f"🎙️ New Voice detected: {new_id}")
         
         return obs.entity_id
 
     def register_observation(self, obs: Union[FaceObservation, VoiceObservation]):
         """
-        API Parity: Mandatory final step for observation ingestion.
-        Syncs the resolved identity to both Vector and Graph databases.
+        Links the observation to the entity in both Graph and Vector Store.
+        Uses the resolved (canonical) entity_id.
         """
-        # Ensure identity is resolved
         if not obs.entity_id:
-            if isinstance(obs, FaceObservation):
-                self.resolve_face(obs)
-            else:
-                self.resolve_voice(obs)
+            logger.warning("Observation has no entity_id. Skipping registration.")
+            return
 
-        col = self.collections["face"] if isinstance(obs, FaceObservation) else self.collections["voice"]
-        
-        # 1. Update Graph (Idempotent MERGE)
+        # 1. Update Graph (Async)
         query = """
         MATCH (c:Clip {id: $clip_id, video_id: $video_id})
         MATCH (e:Entity {id: $entity_id})
@@ -146,7 +151,8 @@ class IdentityManager:
             "ts": obs.ts_ms
         })
 
-        # 2. Update Vector Store (Idempotent)
+        # 2. Update Vector Store (Sync/Fast)
+        collection = self.collections["face"] if isinstance(obs, FaceObservation) else self.collections["voice"]
         payload = {
             "video_id": obs.video_id,
             "entity_id": obs.entity_id,
@@ -154,111 +160,168 @@ class IdentityManager:
             "obs_id": obs.obs_id,
             "type": "resolved_identity"
         }
-        self.vector_store.upsert(col, obs.obs_id, obs.embedding, payload)
+        self.vector_store.upsert(collection, obs.obs_id, obs.embedding, payload)
 
-    def _update_stats(self, eid, modality):
-        if eid not in self.entity_stats: self.entity_stats[eid] = {'voice': 0, 'face': 0}
-        self.entity_stats[eid][modality] += 1
-
-    # --- 🔥 SOTA FEATURES BELOW ---
+    # --- SOTA Maintenance Features ---
 
     def consolidate_identities(self, video_id: str):
         """
-        Fixes "8 voices for 2 people".
-        Looks at all voice entities. If they are similar vectors, MERGE them.
+        Scans for entities that are extremely similar and merges them.
+        Fixes the 'Fragmented Identity' problem (e.g., same person, slightly different lighting).
         """
-        # 1. Get all voice entities created for this video
-        entities_to_check = []
-        seen_ids = set()
+        # Ensure latest graph writes are visible before we start querying logic
+        self.graph_store.flush()
         
-        # Scroll to find candidates
-        # Using internal client scroll for raw access 
-        scroll_res, _ = self.vector_store.client.scroll(
-            collection_name="voice_memories",
-            scroll_filter=self.vector_store._build_filter({"video_id": video_id}),
-            limit=100,
-            with_vectors=True
-        )
-        
-        for point in scroll_res:
-            eid = point.payload['entity_id']
-            if eid not in seen_ids:
-                entities_to_check.append({"id": eid, "vector": point.vector})
-                seen_ids.add(eid)
+        # We process voices specifically as they are prone to fragmentation
+        self._consolidate_collection("voice_memories", video_id, threshold=0.85)
+        # We can also do faces
+        self._consolidate_collection("face_memories", video_id, threshold=0.80)
 
-        # 2. Compare All-vs-All
-        merges_done = set()
+    def _consolidate_collection(self, collection_name: str, video_id: str, threshold: float):
+        """
+        Internal logic to fetch vectors, cluster them, and trigger merges.
+        """
+        # 1. Fetch representatives
+        # We scroll to get vectors. For large videos, we'd use a better sampling strategy.
+        try:
+            points, _ = self.vector_store.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=self.vector_store._build_filter({"video_id": video_id}),
+                limit=150, # Check last 150 observations
+                with_vectors=True
+            )
+        except Exception:
+            return
+
+        if not points: return
+
+        # Group by Entity ID to get a "Centroid" or list of vectors per entity
+        entity_vectors = {}
+        for p in points:
+            eid = self.get_canonical_id(p.payload['entity_id'])
+            if eid not in entity_vectors: entity_vectors[eid] = []
+            entity_vectors[eid].append(p.vector)
+
+        # 2. Compare Entities
+        # Simple centroid comparison
+        unique_ids = list(entity_vectors.keys())
+        centroids = [np.mean(entity_vectors[uid], axis=0) for uid in unique_ids]
         
-        for i in range(len(entities_to_check)):
-            for j in range(i + 1, len(entities_to_check)):
-                e1 = entities_to_check[i]
-                e2 = entities_to_check[j]
-                
-                if e1['id'] in merges_done or e2['id'] in merges_done: continue
+        merged_in_this_pass = set()
+
+        for i in range(len(unique_ids)):
+            id_a = unique_ids[i]
+            if id_a in merged_in_this_pass: continue
+
+            for j in range(i + 1, len(unique_ids)):
+                id_b = unique_ids[j]
+                if id_b in merged_in_this_pass: continue
                 
                 # Cosine Similarity
-                sim = np.dot(e1['vector'], e2['vector'])
+                vec_a = centroids[i]
+                vec_b = centroids[j]
+                sim = np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
                 
-                if sim > 0.80:
-                    logger.info(f"🔄 Merging Fragmented Voice: {e2['id']} -> {e1['id']} (Sim: {sim:.2f})")
-                    self._deep_merge(e1['id'], e2['id'], video_id)
-                    merges_done.add(e2['id'])
+                if sim > threshold:
+                    logger.info(f"🔄 Auto-Merging: {id_b} -> {id_a} (Sim: {sim:.3f})")
+                    self._merge_entities_safe(keep_id=id_a, drop_id=id_b, video_id=video_id)
+                    merged_in_this_pass.add(id_b)
+
+    def _merge_entities_safe(self, keep_id: str, drop_id: str, video_id: str):
+        """
+        Perform a Robust Merge:
+        1. Update Alias Map (RAM)
+        2. Create Graph Link (Audit)
+        3. Move Graph Relationships (History)
+        4. Update Vector Payloads (Search)
+        """
+        # 1. Update In-Memory Map
+        self._alias_map[drop_id] = keep_id
+
+        # 2. Graph Rewiring (Async but critical)
+        # We use APOC if available, or manual Cypher rewriting
+        query = """
+        MATCH (winner:Entity {id: $keep_id})
+        MATCH (loser:Entity {id: $drop_id})
+        
+        // 1. Create audit trail
+        MERGE (loser)-[:MERGED_INTO {ts: timestamp()}]->(winner)
+        SET loser.active = false
+        
+        // 2. Move 'APPEARED_IN' relationships
+        WITH winner, loser
+        MATCH (loser)-[r:APPEARED_IN]->(clip)
+        MERGE (winner)-[r2:APPEARED_IN {obs_id: r.obs_id}]->(clip)
+        SET r2.ts_ms = r.ts_ms
+        DELETE r
+        
+        // 3. Move 'SPOKE' relationships (Dialogue)
+        WITH winner, loser
+        MATCH (loser)-[r:SPOKE]->(dial)
+        MERGE (winner)-[r2:SPOKE]->(dial)
+        DELETE r
+        
+        // 4. Move 'MENTIONS' from Memories
+        WITH winner, loser
+        MATCH (mem)-[r:MENTIONS]->(loser)
+        MERGE (mem)-[r2:MENTIONS]->(winner)
+        DELETE r
+        """
+        
+        self.graph_store.execute_async(query, {"keep_id": keep_id, "drop_id": drop_id})
+        
+        # 3. Vector Update (Qdrant)
+        # Retag all vectors of the 'drop_id' to 'keep_id'
+        for col in [self.collections["face"], self.collections["voice"], "text_memories"]:
+            try:
+                self.vector_store.update_point_entity(col, drop_id, keep_id, video_id)
+            except Exception as e:
+                # text_memories might not have entity_id in all points, ignore errors
+                pass
 
     def detect_pov_operator(self, video_id: str):
         """
-        Identifies the 'Invisible Protagonist' (Body Cam User).
+        Identify the 'Invisible Protagonist'.
+        Logic: The entity that speaks the most but is seen the least (or never).
         """
-        # Refresh stats from Graph
+        # Ensure consistency
+        self.graph_store.flush()
+        
         query = """
         MATCH (e:Entity {video_id: $video_id})
-        OPTIONAL MATCH (e)-[:APPEARED_IN]->(c:Clip)
-        WITH e, count(c) as total_clips
-        RETURN e.id as id, total_clips
+        WHERE NOT (e)-[:MERGED_INTO]->() // Ignore merged ghosts
+        
+        // Count appearances
+        OPTIONAL MATCH (e)-[r_face:APPEARED_IN]->() WHERE r_face.obs_id CONTAINS 'face'
+        WITH e, count(r_face) as face_count
+        
+        // Count speech
+        OPTIONAL MATCH (e)-[r_voice:APPEARED_IN]->() WHERE r_voice.obs_id CONTAINS 'voice'
+        WITH e, face_count, count(r_voice) as voice_count
+        
+        RETURN e.id as id, face_count, voice_count
         """
+        
         results = self.graph_store.run_query(query, {"video_id": video_id})
         
-        max_clips = 0
-        pov_candidate = None
+        best_candidate = None
+        max_voice = 0
         
-        for res in results:
-            eid = res['id']
-            # Get specific modality count
-            q_mod = "MATCH (e:Entity {id: $eid})-[r:APPEARED_IN]->() WHERE r.obs_id CONTAINS 'face' RETURN count(r) as c"
-            face_count = self.graph_store.run_query(q_mod, {"eid": eid})[0]['c']
+        for r in results:
+            fid = r['id']
+            f_count = r['face_count']
+            v_count = r['voice_count']
             
-            # Heuristic: Consistent voice (>3 clips), NO face
-            if res['total_clips'] > 3 and face_count == 0 and "voice" in eid:
-                if res['total_clips'] > max_clips:
-                    max_clips = res['total_clips']
-                    pov_candidate = eid
+            # Heuristic: Lots of voice (>5 clips), Zero faces
+            if v_count > 5 and f_count == 0:
+                if v_count > max_voice:
+                    max_voice = v_count
+                    best_candidate = fid
         
-        if pov_candidate:
-            logger.info(f"🕵️ POV DETECTED: {pov_candidate} is likely the Camera Operator.")
+        if best_candidate:
+            logger.info(f"🕵️ POV DETECTED: {best_candidate} identified as Camera Operator.")
+            # Tag in Graph
             self.graph_store.execute_async("""
                 MATCH (e:Entity {id: $eid})
                 SET e.type = 'pov_user', e.alias = 'Camera Operator'
-            """, {"eid": pov_candidate})
-            
-    def _deep_merge(self, keep_id, remove_id, video_id):
-        # 1. Update Vectors
-        for col in ["voice_memories", "face_memories"]:
-             self.vector_store.update_point_entity(col, remove_id, keep_id, video_id)
-            
-        # 2. Update Graph
-        query = """
-        MATCH (old:Entity {id: $remove_id})
-        MATCH (new:Entity {id: $keep_id})
-        OPTIONAL MATCH (old)-[r]->(target)
-        MERGE (new)-[r2:APPEARED_IN]->(target)
-        SET r2 = r
-        DETACH DELETE old
-        """
-        self.graph_store.execute_async(query, {"remove_id": remove_id, "keep_id": keep_id})
-
-    # Keep compatibility with main loop call
-    def link_modalities(self, video_id: str):
-        pass
-
-    def detect_and_tag_pov(self, video_id: str):
-        # Forward to new method
-        self.detect_pov_operator(video_id)
+            """, {"eid": best_candidate})

@@ -1,6 +1,8 @@
 import logging
 import json
+import uuid
 from typing import List, Dict, Any, Optional
+import numpy as np  # Ensure numpy is imported
 from qdrant_client import models
 from conclave.core.schemas import (
     FaceObservation, VoiceObservation, 
@@ -31,6 +33,55 @@ class ConclaveEngine:
             "visual": "visual_memories",
             "text": "text_memories"
         }
+
+    def ingest_semantic_memory(self, memory: MemoryNode):
+        """
+        M3-Style Smart Ingestion:
+        Instead of creating duplicates, we REINFORCE existing memories if they are similar.
+        """
+        # 1. Get embedding for the new memory
+        if not memory.embedding:
+            memory.embedding = self.embedding_service.get_embeddings_batched([memory.content])[0]
+
+        # 2. Check for existing related memories (The "Systematic" Check)
+        # We look at the primary entity involved
+        primary_entity = memory.linked_entities[0] if memory.linked_entities else None
+        
+        should_create_new = True
+        
+        if primary_entity:
+            # Get existing semantic nodes for this entity
+            existing_nodes = self.graph_store.get_connected_semantic_nodes(primary_entity)
+            
+            # Retrieve their vectors to compare (We batch fetch from Qdrant for speed)
+            if existing_nodes:
+                existing_ids = [n['id'] for n in existing_nodes]
+                vectors = self.vector_store.client.retrieve(
+                    collection_name="text_memories",
+                    ids=existing_ids,
+                    with_vectors=True
+                )
+                
+                # Compare Logic
+                for existing_point in vectors:
+                    if not existing_point.vector: continue
+                    
+                    # Cosine Similarity
+                    sim = np.dot(memory.embedding, existing_point.vector)
+                    
+                    if sim > 0.85:
+                        logger.info(f"💪 Reinforcing Memory '{existing_point.payload.get('content')}' (Sim: {sim:.2f})")
+                        # M3 Logic: Reinforce edge weight, don't create new node
+                        self.graph_store.update_edge_weight(existing_point.id, primary_entity, 1.0)
+                        should_create_new = False
+                        break # Found a match, stop looking
+                    elif sim < 0.0:
+                        # Contradiction? Weaken it.
+                        self.graph_store.update_edge_weight(existing_point.id, primary_entity, -0.5)
+
+        # 3. Create only if unique
+        if should_create_new:
+            self.add_memory(memory)
 
     def ingest_face(self, obs: FaceObservation):
         """
@@ -136,6 +187,10 @@ class ConclaveEngine:
 
     def get_hybrid_context(self, query_vector: List[float], top_k: int = 5):
         """Perform Vector search then expand context via Graph."""
+        
+        # 🔥 CRITICAL FIX: Ensure graph is up to date before querying
+        self.graph_store.flush()
+        
         # 1. Find the most relevant moments (Qdrant)
         vectors = self.vector_store.search(
             self.collections["text"], 
@@ -148,56 +203,59 @@ class ConclaveEngine:
         for v in vectors:
             # 2. For each moment, find who was involved (Neo4j)
             query = """
-            MATCH (m:Memory {id: $mem_id})-[:MENTIONS]->(e:Entity)
+            MATCH (m:Memory {id: $mem_id})
+            // Optional: Get entities mentioned
+            OPTIONAL MATCH (m)-[:MENTIONS]->(e:Entity)
             RETURN e.id as id, e.type as type
             """
             entities = self.graph_store.run_query(query, {"mem_id": v.id})
             
+            # Filter out None if optional match fails
+            valid_entities = [e for e in entities if e['id'] is not None]
+
             results.append({
                 "content": v.payload["content"],
                 "clip_id": v.payload["clip_id"],
                 "score": v.score,
-                "involved_entities": entities
+                "involved_entities": valid_entities
             })
             
         return results
 
     def ingest_dialogue_event(self, video_id: str, clip_id: int, entity_id: str, text: str, ts_ms: int):
         """
-        Handles full lifecycle of a spoken line:
-        1. Clean Text
-        2. Embed Text (Semantic)
-        3. Store in Qdrant (Text Collection)
-        4. Store in Neo4j (Graph Relational)
+        Handles full lifecycle of a spoken line with VALID QDRANT ID.
         """
         if not text or len(text) < 2: return
 
-        # 1. Clean Text (Remove quotes, extra spaces)
+        # 1. Clean Text
         clean_text = text.replace('"', '').replace("'", "").strip()
         
-        # 2. Embed Text (Semantic Vector)
-        # We reuse the embedding_service defined in __init__
+        # 2. Embed Text
         text_vector = self.embedding_service.get_embeddings_batched([clean_text])[0]
         
-        # 3. Store in Qdrant 'text_memories'
-        # We tag it as type='dialogue' so we can filter later
-        mem_id = f"dial_{video_id}_{clip_id}_{ts_ms}"
+        # 3. GENERATE VALID UUID (CRITICAL FIX)
+        # We use uuid5 with a seed string to make it deterministic (same text+time = same ID)
+        seed_string = f"dial_{video_id}_{clip_id}_{ts_ms}_{entity_id}"
+        mem_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed_string)) 
         
+        # 4. Store in Qdrant 'text_memories'
         self.vector_store.upsert(
             "text_memories",
-            mem_id,
+            mem_id,  # <--- Now passing a proper UUID string
             text_vector,
             {
                 "video_id": video_id,
                 "clip_id": clip_id,
                 "entity_id": entity_id,
                 "content": clean_text,
-                "type": "dialogue",  # <--- Distinct from 'episodic' or 'semantic'
-                "ts_ms": ts_ms
+                "type": "dialogue",
+                "ts_ms": ts_ms,
+                "readable_id": seed_string # Store original ID in payload for debugging
             }
         )
         
-        # 4. Store in Neo4j
+        # 5. Store in Neo4j
         self.graph_store.ingest_dialogue(video_id, clip_id, entity_id, clean_text, ts_ms)
         
         logger.info(f"🗣️ DIALOGUE: {entity_id} said '{clean_text}' (Saved to Graph+Vec)")

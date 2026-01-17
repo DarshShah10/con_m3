@@ -22,9 +22,18 @@ class GraphStore:
         self.worker_thread.start()
 
     def close(self):
-        # Wait for queue to empty before closing
-        self.write_queue.join()
+        self.flush() # Ensure pending writes are done
         self.driver.close()
+        
+    def flush(self):
+        """
+        BLOCKS until all pending graph writes are finished.
+        Call this before performing complex reasoning or identity merges 
+        that rely on the latest data.
+        """
+        if not self.write_queue.empty():
+            # logger.debug("Waiting for graph writes to flush...")
+            self.write_queue.join()
 
     def _async_worker(self):
         while True:
@@ -38,21 +47,14 @@ class GraphStore:
                 with self.driver.session() as session:
                     session.run(query, params)
                 
-                # 🔥 LOGGING ADDED HERE
-                # We interpret the query intent for nicer logs
+                # Optional: Reduced logging noise
                 if "[:HAS_TEXT]" in query:
-                    logger.info(f"🔹 GRAPH: Linked Text to Object")
+                    logger.debug(f"🔹 GRAPH: Linked Text")
                 elif "[:SPOKE]" in query:
-                    speaker = params.get('entity_id', 'Unknown')
-                    logger.info(f"🔹 GRAPH: Speaker {speaker} -> Dialogue Stored")
-                elif "pov_user" in query:
-                    logger.info(f"🔹 GRAPH: Updated POV User Status")
-                # General fallback for other queries (uncomment if you want to see EVERYTHING)
-                # else:
-                #    logger.info(f"🔹 GRAPH: Executed Query")
-
+                    logger.debug(f"🔹 GRAPH: Dialogue Stored")
+                    
             except Exception as e:
-                logger.error(f"❌ Graph Write Failed: {e}\nQuery: {query}")
+                logger.error(f"❌ Graph Write Failed: {e}")
             finally:
                 self.write_queue.task_done()
 
@@ -196,3 +198,29 @@ class GraphStore:
             "clip_id": clip_id, "video_id": video_id, 
             "entity_id": entity_id, "text": text, "ts": ts_ms
         }))
+
+    def update_edge_weight(self, source_id: str, target_id: str, delta: float):
+        """
+        M3-Style Reinforcement:
+        Increases or decreases the weight of a relationship.
+        Used when a new observation confirms or denies an old memory.
+        """
+        query = """
+        MATCH (a {id: $source_id})-[r]->(b {id: $target_id})
+        // Initialize weight if missing
+        SET r.weight = COALESCE(r.weight, 1.0) + $delta
+        RETURN r.weight as new_weight
+        """
+        # We execute this async because it's an update, not a read-dependency
+        self.execute_async(query, {"source_id": source_id, "target_id": target_id, "delta": delta})
+
+    def get_connected_semantic_nodes(self, entity_id: str):
+        """
+        Retrieves existing semantic memories linked to an entity.
+        Used to check if we should add a new memory or reinforce an old one.
+        """
+        query = """
+        MATCH (e:Entity {id: $entity_id})<-[:MENTIONS]-(m:Memory {type: 'semantic'})
+        RETURN m.id as id, m.content as content
+        """
+        return self.run_query(query, {"entity_id": entity_id})
