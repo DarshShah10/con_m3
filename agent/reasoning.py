@@ -31,7 +31,7 @@ class ReasoningAgent:
         self.max_retries = config.get("max_retries", 3)
 
         # Matches <ent_uuid> or raw UUIDs
-        self.entity_pattern = re.compile(r"<([a-f0-9\-]{12,36}|ent_[a-z0-9]+)>")
+        self.entity_pattern = re.compile(r"<(ent_[a-zA-Z0-9_]+|[a-f0-9\-]{36})>")
 
     # ------------------------------------------------------------------
     # JSON SAFETY
