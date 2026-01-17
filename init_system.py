@@ -12,19 +12,29 @@ def init_conclave():
     
     collections = {
         "text_memories": 3072,   # text-embedding-3-large
-        "face_memories": 512,    # InsightFace buffalo_l
-        "voice_memories": 192,   # WeSpeaker ERes2Net
-        "visual_memories": 1152  # SigLIP-so400m
+        "face_memories": 512,    # InceptionResnetV1 (Facenet)
+        "voice_memories": 192,   # SpeechBrain ECAPA-TDNN
+        "visual_memories": 768   # SigLIP-base
     }
 
     for name, size in collections.items():
-        print(f"[*] Creating Qdrant collection: {name} (dim: {size})")
+        print(f"[*] Checking Qdrant collection: {name} (dim: {size})")
+        
+        # Recreate collection to ensure clean state
         qc.recreate_collection(
             collection_name=name,
             vectors_config=models.VectorParams(size=size, distance=models.Distance.COSINE)
         )
-        # Create indexing for fast filtering by video_id
+        
+        # --- 🔥 CRITICAL INDEXES ---
+        # 1. Video ID (for filtering by session)
         qc.create_payload_index(name, "video_id", models.PayloadSchemaType.KEYWORD)
+        
+        # 2. Entity ID (for Identity Merging) <-- THIS WAS MISSING
+        if name in ["face_memories", "voice_memories"]:
+            qc.create_payload_index(name, "entity_id", models.PayloadSchemaType.KEYWORD)
+            
+        print(f"    -> Created indexes for {name}")
 
     # 2. Initialize Neo4j Constraints
     print("[*] Setting up Neo4j Constraints...")

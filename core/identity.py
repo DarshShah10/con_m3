@@ -185,34 +185,38 @@ class IdentityManager:
         logger.warning(f"🔄 DEEP MERGE INITIATED: Unifying {target_id} into {source_id}")
 
         # 1. Graph Refactor (Neo4j) - Move all relationships
+        def merge_identities(self, source_id: str, target_id: str, video_id: str):
+        """
+        Step 3: Safe Merge (The "Deep Refactor").
+        Uses Async Graph Writes to prevent blocking the perception loop.
+        """
+        if source_id == target_id:
+            return
+
+        logger.warning(f"Identity Merger: Unifying {target_id} into {source_id}")
+
+        # 1. Update Graph Relationships (Neo4j) - ASYNC NOW
         merge_query = """
         MATCH (primary:Entity {id: $source_id}), (secondary:Entity {id: $target_id})
-        
-        // Move APPEARED_IN relationships
         OPTIONAL MATCH (secondary)-[r:APPEARED_IN]->(c:Clip)
         WITH primary, secondary, r, c
         WHERE r IS NOT NULL
         MERGE (primary)-[new_r:APPEARED_IN {obs_id: r.obs_id}]->(c)
         ON CREATE SET new_r.ts_ms = r.ts_ms
-        
         WITH primary, secondary
-        
-        // Move MENTIONS relationships
         OPTIONAL MATCH (m:Memory)-[r2:MENTIONS]->(secondary)
         WITH primary, secondary, m
         WHERE m IS NOT NULL
         MERGE (m)-[:MENTIONS]->(primary)
-        
         WITH secondary
-        // Delete the secondary entity
         DETACH DELETE secondary
         """
-        
-        self.graph_store.run_query(merge_query, {
+        # 🔥 FIX: Use execute_async
+        self.graph_store.execute_async(merge_query, {
             "source_id": source_id,
             "target_id": target_id
         })
-        logger.info(f"✓ Neo4j graph refactored: {target_id} merged into {source_id}")
+
 
         # 2. Vector Payload Update (Qdrant) - Retag all historical vectors
         for col_name in self.collections.values():

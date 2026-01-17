@@ -27,7 +27,7 @@ class ReasoningAgent:
         
         api_key = config.get("openai_api_key") or config.get("api_key")
         self.client = openai.OpenAI(api_key=api_key)
-        self.model = config.get("model", "gpt-4o")
+        self.model = config.get("model", "gpt-5-mini")
         self.max_retries = config.get("max_retries", 3)
 
         # Matches <ent_uuid> or raw UUIDs
