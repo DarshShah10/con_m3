@@ -90,10 +90,20 @@ class ConclaveOrchestrator:
 
     def _load_scene_model(self):
         from conclave.perception.vision.scene import SceneProcessor
-        logger.info("-> Loading SceneProcessor...")
-        return SceneProcessor(self.config.get("processing", {}))
+        logger.info("-> Loading SceneProcessor (Gemini API)...")
+        
+        # Start with processing config
+        process_config = self.config.get("processing", {}).copy()
+        
+        # Inject Gemini config
+        if "gemini" in self.config:
+            process_config["gemini"] = self.config["gemini"]
+        else:
+            logger.warning("⚠️ No 'gemini' section found in config!")
+        
+        return SceneProcessor(process_config)
 
-    def run_pipeline(self, video_path: str, window_size: int = 30, overlap: int = 5):
+    def run_pipeline(self, video_path: str, window_size: int = 30, overlap: int = 3):
         if not os.path.exists(video_path):
             logger.error(f"Video not found: {video_path}")
             return
@@ -155,14 +165,10 @@ class ConclaveOrchestrator:
             
             # --- Parallel Tasks: Scene / Face / Voice ---
             def task_scene():
-                # Scene: run every ~5.0s. With extraction at 5 FPS, stride=25 -> 5s.
-                stride = 25
-                selected = data["raw_frames"][::stride]
-                if not selected:
-                    return []
-                interval_ms = int((1000 / 5) * stride)
+                # We have 1 FPS now. Process all of them.
+                # The scene_processor will handle the 3-second skipping logic internally.
                 return self.scene_proc.process_batch(
-                    selected, self.video_id, clip_id, int(current_start * 1000), interval_ms
+                    data["raw_frames"], self.video_id, clip_id, int(current_start * 1000), 1000
                 )
 
             def task_face():
@@ -226,11 +232,11 @@ class ConclaveOrchestrator:
     def _fast_extract(self, video_path: str, start: float, duration: float):
         """
         Extracts raw frames and audio bytes directly into RAM using FFmpeg pipes.
-        10x faster than MoviePy because it avoids re-encoding and temp files.
+        Includes automatic resizing to 640p height for speed.
         """
         clip_data = {"audio_bytes": None, "raw_frames": []}
         
-        # 1. Extract Audio to RAM (pcm_s16le wav)
+        # 1. Extract Audio
         try:
             out, _ = (
                 ffmpeg
@@ -240,44 +246,44 @@ class ConclaveOrchestrator:
             )
             clip_data["audio_bytes"] = out
         except ffmpeg.Error:
-            pass # No audio stream or error
+            pass 
 
-        # 2. Extract Frames to RAM (decoding to BGR numpy)
-        # Using OpenCV VideoCapture is faster for sequential reading than random seek
-        # But for clips, seeking is needed.
+        # 2. Extract Frames
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
         
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps == 0: fps = 25 # Fallback
+        if fps == 0: fps = 25
         
-        target_fps = 5
+        target_fps = 1 # Keep this at 1 FPS for speed
         step = max(1, int(fps / target_fps))
         
         frames_needed = int(duration * target_fps)
         frames_read = 0
-
         count = 0
+        
+        # OPTIMIZATION: Target Height
+        TARGET_H = 640
+
         while frames_read < frames_needed:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Take every Nth frame based on step
             if count % step == 0:
-                # Resize to max-height 640 to save memory and speed up CNNs
+                # --- GLOBAL RESIZE OPTIMIZATION ---
                 h, w = frame.shape[:2]
-                if h > 640:
-                    scale = 640 / float(h)
+                if h > TARGET_H:
+                    scale = TARGET_H / float(h)
                     new_w = int(w * scale)
-                    frame = cv2.resize(frame, (new_w, 640), interpolation=cv2.INTER_AREA)
+                    # Resize to (new_w, 640)
+                    frame = cv2.resize(frame, (new_w, TARGET_H), interpolation=cv2.INTER_AREA)
+                # ----------------------------------
 
                 clip_data["raw_frames"].append(frame)
                 frames_read += 1
 
             count += 1
-
-            # Safety break if we go way past duration
             if (cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0) > (start + duration + 1):
                 break
                 

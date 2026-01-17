@@ -16,14 +16,15 @@ logger = logging.getLogger("Conclave.Vision.Face")
 class FaceProcessor:
     def __init__(self, config: Dict[str, Any]):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Generalization Settings
         self.quality_threshold = config.get("face_quality_score_threshold", 22.0)
         self.min_cluster_size = config.get("min_cluster_size", 3)
         
-        # 1. Detection: YOLOv8-Face (SOTA Speed)
-        # Downloads a specific face-detection fine-tune of YOLOv8n
-        logger.info("⚡ Loading YOLOv8-Face (High Speed)...")
+        # 1. Detection: YOLOv8-Face (Fastest)
+        logger.info("⚡ Loading YOLOv8-Face...")
         model_path = hf_hub_download(repo_id="arnabdhar/YOLOv8-Face-Detection", filename="model.pt")
-        self.detector = YOLO(model_path) # Auto-loads to GPU if available
+        self.detector = YOLO(model_path)
 
         # 2. Recognition: InceptionResnetV1
         self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
@@ -38,37 +39,46 @@ class FaceProcessor:
         batch_crops = []
         batch_meta = [] 
 
-        # Configurable "Meme Filter"
-        # Ignore faces smaller than 1.5% of the image area
-        MIN_FACE_AREA_RATIO = 0.015 
+        # --- GENERALIZATION CONFIG ---
+        # Instead of %, we use pixels. 
+        # A 30x30 pixel face is the minimum for recognition. 
+        # Anything smaller is just a blur or an emoji.
+        MIN_FACE_PIXELS = 30 
+        
+        faces_found = 0
+        faces_skipped = 0
 
         for idx, frame_input in enumerate(frames):
-            # Process every frame provided (Stride handled in main.py)
             img_bgr = frame_input if isinstance(frame_input, np.ndarray) else None
             if img_bgr is None: continue 
 
             height, width = img_bgr.shape[:2]
-            img_area = height * width
 
-            # YOLO Detect (Verbose=False for speed)
+            # Run Detector
             results = self.detector(img_bgr, verbose=False, device=self.device)
 
             for r in results:
                 for box in r.boxes:
-                    # Filter by confidence
-                    if float(box.conf) < 0.6: continue
+                    # Confidence check (keep it reasonably high to avoid trash)
+                    if float(box.conf) < 0.5: continue
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                     
-                    # --- MEME FILTER ---
-                    # If face is too small (e.g. tiny meme in corner), skip it
-                    face_area = (x2 - x1) * (y2 - y1)
-                    if (face_area / img_area) < MIN_FACE_AREA_RATIO:
+                    w_face = x2 - x1
+                    h_face = y2 - y1
+
+                    # --- SIZE FILTER ---
+                    # If face is smaller than 30x30 pixels, ignore it.
+                    # This filters out chat emotes but keeps xQc/Adin/MrBeast.
+                    if w_face < MIN_FACE_PIXELS or h_face < MIN_FACE_PIXELS:
+                        faces_skipped += 1
                         continue
 
-                    # Padding logic (Context helps recognition)
-                    pad_x = int((x2 - x1) * 0.1)
-                    pad_y = int((y2 - y1) * 0.1)
+                    faces_found += 1
+
+                    # Padding (Add context for better recognition)
+                    pad_x = int(w_face * 0.1)
+                    pad_y = int(h_face * 0.1)
                     x1 = max(0, x1 - pad_x)
                     y1 = max(0, y1 - pad_y)
                     x2 = min(width, x2 + pad_x)
@@ -77,30 +87,37 @@ class FaceProcessor:
                     face_crop = img_bgr[y1:y2, x1:x2]
                     if face_crop.size == 0: continue
 
-                    # Prepare for embedding (BGR -> RGB -> PIL -> Tensor)
+                    # Prepare for ResNet (160x160)
                     face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
                     face_pil = Image.fromarray(face_rgb).resize((160, 160))
                     
                     tensor = torch.tensor(np.array(face_pil)).permute(2, 0, 1).float().div(255).sub(0.5).div(0.5)
                     
-                    # Low-res thumbnail for storage
+                    # Thumbnail
                     _, buffer = cv2.imencode('.jpg', face_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                     face_b64 = base64.b64encode(buffer).decode('utf-8')
 
                     batch_crops.append(tensor)
                     batch_meta.append({
-                        "ts": idx * 200, # Approximation
+                        "ts": idx * 1000, # Approx for 1 FPS
                         "box": [x1, y1, x2, y2],
                         "prob": float(box.conf),
                         "b64": face_b64
                     })
 
+        # Debug Logging
+        if faces_found > 0:
+            logger.info(f"👤 Faces Found: {faces_found} (Skipped {faces_skipped} tiny ones)")
+        elif faces_skipped > 0:
+            logger.warning(f"👤 No usable faces. Found {faces_skipped}, but all were < {MIN_FACE_PIXELS}px.")
+        else:
+            logger.info("👤 No faces detected in this clip.")
+
         if not batch_crops:
             return []
 
-        # Batch Inference on GPU
+        # Batch Inference
         face_tensor_batch = torch.stack(batch_crops).to(self.device)
-        
         with torch.no_grad():
             embeddings_batch = self.resnet(face_tensor_batch).cpu().numpy()
 
