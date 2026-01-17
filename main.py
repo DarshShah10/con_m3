@@ -135,6 +135,9 @@ class ConclaveOrchestrator:
         # ----------------------------------------------------------------
         # 2. Inference Consumer (A40 Optimized)
         # ----------------------------------------------------------------
+        # Use a small thread pool to run Scene/Face/Voice in parallel per-clip
+        perception_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
         while True:
             # If queue is empty, GPU is starving -> Bad.
             if clip_queue.empty():
@@ -150,39 +153,56 @@ class ConclaveOrchestrator:
             
             logger.info(f"⚡ Processing Clip {clip_id} [{current_start:.1f}s] (Buffer: {clip_queue.qsize()})...")
             
-            # --- A. SCENE UNDERSTANDING ---
-            stride = 10 
-            selected_frames = data["raw_frames"][::stride]
-            
-            visuals = []
-            if selected_frames:
-                visuals = self.scene_proc.process_batch(
-                    selected_frames, 
-                    self.video_id, 
-                    clip_id, 
-                    int(current_start*1000), 
-                    200 * stride
+            # --- Parallel Tasks: Scene / Face / Voice ---
+            def task_scene():
+                # Scene: run every ~5.0s. With extraction at 5 FPS, stride=25 -> 5s.
+                stride = 25
+                selected = data["raw_frames"][::stride]
+                if not selected:
+                    return []
+                interval_ms = int((1000 / 5) * stride)
+                return self.scene_proc.process_batch(
+                    selected, self.video_id, clip_id, int(current_start * 1000), interval_ms
                 )
-                for v in visuals:
-                    self.engine.vector_store.upsert(
-                        "visual_memories", v.obs_id, v.clip_embedding, 
-                        {"video_id": self.video_id, "clip_id": clip_id, "desc": v.detected_objects[0]}
-                    )
 
-            # --- B. FACE PERCEPTION ---
-            faces = self.face_proc.extract_from_frames(data["raw_frames"], self.video_id, clip_id)
+            def task_face():
+                # Face: target ~0.5s (2 FPS). With 5 FPS extraction, stride=2 gives ~2.5 FPS (good balance).
+                stride = 2
+                selected = data["raw_frames"][::stride]
+                if not selected:
+                    return []
+                return self.face_proc.extract_from_frames(selected, self.video_id, clip_id)
+
+            def task_voice():
+                if data.get("audio_bytes"):
+                    return self.voice_proc.process_clip_audio(data["audio_bytes"], self.video_id, clip_id)
+                return []
+
+            future_scene = perception_executor.submit(task_scene)
+            future_face = perception_executor.submit(task_face)
+            future_voice = perception_executor.submit(task_voice)
+
+            visuals = future_scene.result()
+            faces = future_face.result()
+            voices = future_voice.result()
+
+            # Commit visuals
+            for v in visuals:
+                self.engine.vector_store.upsert(
+                    "visual_memories", v.obs_id, v.clip_embedding,
+                    {"video_id": self.video_id, "clip_id": clip_id, "desc": v.detected_objects[0]}
+                )
+
+            # Faces: cluster & resolve
             for f in self.face_proc.cluster_clip_faces(faces):
                 self.identity_manager.resolve_face(f)
                 self.engine.ingest_face(f)
                 self.identity_manager.register_observation(f)
 
-            # --- C. AUDIO PERCEPTION ---
-            voices = []
-            if data["audio_bytes"]:
-                voices = self.voice_proc.process_clip_audio(data["audio_bytes"], self.video_id, clip_id)
-                for v in voices:
-                    self.identity_manager.resolve_voice(v)
-                    self.identity_manager.register_observation(v)
+            # Voices
+            for v in voices:
+                self.identity_manager.resolve_voice(v)
+                self.identity_manager.register_observation(v)
 
             # --- D. REASONING ---
             episodes = self.reasoning_agent.generate_episodic_memory(
@@ -197,8 +217,9 @@ class ConclaveOrchestrator:
             # Optimized Cleanup: Only clear cache if VRAM is actually tight
             # On A40 (48GB), we barely need this.
             if clip_id % 50 == 0:
-                 torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
+        perception_executor.shutdown()
         prefetcher.shutdown()
         logger.info("✅ Pipeline Execution Complete.")
 
@@ -235,16 +256,27 @@ class ConclaveOrchestrator:
         
         frames_needed = int(duration * target_fps)
         frames_read = 0
-        
+
+        count = 0
         while frames_read < frames_needed:
             ret, frame = cap.read()
-            if not ret: break
-            
-            # Only keep every Nth frame to match target FPS
-            if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) % step == 0:
+            if not ret:
+                break
+
+            # Take every Nth frame based on step
+            if count % step == 0:
+                # Resize to max-height 640 to save memory and speed up CNNs
+                h, w = frame.shape[:2]
+                if h > 640:
+                    scale = 640 / float(h)
+                    new_w = int(w * scale)
+                    frame = cv2.resize(frame, (new_w, 640), interpolation=cv2.INTER_AREA)
+
                 clip_data["raw_frames"].append(frame)
                 frames_read += 1
-                
+
+            count += 1
+
             # Safety break if we go way past duration
             if (cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0) > (start + duration + 1):
                 break
