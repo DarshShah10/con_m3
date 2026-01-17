@@ -199,20 +199,10 @@ class GraphStore:
             "entity_id": entity_id, "text": text, "ts": ts_ms
         }))
 
-    def update_edge_weight(self, source_id: str, target_id: str, delta: float):
-        """
-        M3-Style Reinforcement:
-        Increases or decreases the weight of a relationship.
-        Used when a new observation confirms or denies an old memory.
-        """
-        query = """
-        MATCH (a {id: $source_id})-[r]->(b {id: $target_id})
-        // Initialize weight if missing
-        SET r.weight = COALESCE(r.weight, 1.0) + $delta
-        RETURN r.weight as new_weight
-        """
-        # We execute this async because it's an update, not a read-dependency
-        self.execute_async(query, {"source_id": source_id, "target_id": target_id, "delta": delta})
+    def update_edge_weight(self, source_id, target_id, delta):
+        q = """MATCH (a {id: $s})-[r]->(b {id: $t}) 
+               SET r.weight = COALESCE(r.weight, 1.0) + $d"""
+        self.execute_async(q, {"s": source_id, "t": target_id, "d": delta})
 
     def get_connected_semantic_nodes(self, entity_id: str):
         """

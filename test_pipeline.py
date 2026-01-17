@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("Conclave.Test")
 
+
 def test_imports():
     """Verify all modules can be imported (detects missing libs/syntax errors)."""
     logger.info("1️⃣  Testing Imports...")
@@ -23,13 +24,13 @@ def test_imports():
         from conclave.core.graph_store import GraphStore
         
         # Perception
-        from conclave.perception.audio.voice import GlobalAudioPipeline # Updated class
+        from conclave.perception.audio.voice import GlobalAudioPipeline
         from conclave.perception.vision.face import FaceProcessor
         from conclave.perception.vision.scene import AdvancedSceneProcessor
         
         # Agents
         from conclave.agent.reasoning import ReasoningAgent
-        from conclave.agent.control import ControlAgent # New Agent
+        from conclave.agent.control import ControlAgent
         
         # Libs
         import whisperx
@@ -57,8 +58,7 @@ def test_identity_logic():
     mock_vec = MagicMock()
     mock_graph = MagicMock()
     
-    # CRITICAL FIX: IdentityManager now loads aliases on init. 
-    # We must mock the graph return to be empty list, or it will crash iterating a Mock.
+    # Mock return for loading alias map to prevent iteration error
     mock_graph.run_query.return_value = [] 
     
     # Init Manager
@@ -72,7 +72,6 @@ def test_identity_logic():
     )
     
     # 1. Test Resolve (New Entity)
-    # Mock vector search returning nothing -> should create new ID
     mock_vec.search.return_value = [] 
     
     eid = im.resolve_face(obs)
@@ -85,7 +84,6 @@ def test_identity_logic():
         
     # 2. Test Safe Merge (M3 Logic)
     im._merge_entities_safe("keep_id", "drop_id", "test_vid")
-    # Verify graph was called with the async query
     if mock_graph.execute_async.called:
         logger.info("✅ Safe Merge Logic triggered Graph Update")
     else:
@@ -98,7 +96,6 @@ def test_reasoning_logic():
     from conclave.agent.reasoning import ReasoningAgent
     from conclave.core.schemas import FaceObservation, VoiceObservation
     
-    # Config with fake key
     config = {"api_key": "sk-fake-key", "model": "gpt-4o"}
     agent = ReasoningAgent(config)
     agent.client = MagicMock()
@@ -108,11 +105,12 @@ def test_reasoning_logic():
     mock_mem_response = {
         "memories": [
             "Person <ent_face_1> smiled.",
-            "Person <ent_ghost> flew away." # Hallucination
+            "Person <ent_ghost> flew away."
         ]
     }
     agent.client.chat.completions.create.return_value.choices[0].message.content = json.dumps(mock_mem_response)
     
+    # Input Data (Must include valid entity for filter to work)
     faces = [FaceObservation(video_id="v", clip_id=1, ts_ms=0, embedding=[], bbox=[], base64_img="", detection_score=0, quality_score=0, entity_id="ent_face_1")]
     
     memories = agent.generate_episodic_memory("v", 1, [], faces, [])
@@ -121,6 +119,8 @@ def test_reasoning_logic():
         logger.error("❌ Hallucination Filter Failed")
     elif "ent_face_1" in memories[0].linked_entities:
         logger.info("✅ Hallucination Filter Works")
+    else:
+        logger.error("❌ Logic Error in Grounding")
         
     # --- TEST B: M3 Equivalence Detection ---
     logger.info("   [B] Testing M3 Equivalence Logic...")
@@ -139,15 +139,14 @@ def test_reasoning_logic():
         logger.error(f"❌ Failed to parse equivalences: {merges}")
 
 def test_control_wiring():
-    """Verify Control Agent can be initialized (Using Patches to skip DB)."""
+    """Verify Control Agent can be initialized."""
     logger.info("\n4️⃣  Testing Control Agent Wiring...")
     
     from conclave.agent.control import ControlAgent
     
-    # We patch 'open' (config read), 'ConclaveEngine' (DB), and 'EmbeddingService'
+    # Patch only what is used: open() and ConclaveEngine
     with patch("builtins.open", new_callable=MagicMock) as mock_open, \
-         patch("conclave.agent.control.ConclaveEngine") as MockEngine, \
-         patch("conclave.agent.control.EmbeddingService") as MockEmbed:
+         patch("conclave.agent.control.ConclaveEngine") as MockEngine:
         
         # Setup mock config
         mock_open.return_value.__enter__.return_value.read.return_value = '{"api": {"openai_api_key": "sk-test"}}'
@@ -164,3 +163,7 @@ if __name__ == "__main__":
     test_reasoning_logic()
     test_control_wiring()
     logger.info("\n🎉 System Check Complete. Pipeline logic is updated and consistent.")
+
+
+
+    

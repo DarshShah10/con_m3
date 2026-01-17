@@ -6,12 +6,12 @@ import argparse
 import cv2
 import ffmpeg
 
-# Add parent directory to path
 # Add parent directory to path so 'conclave' package can be found
-# Current file is at .../conclave/main.py, so we need .../ as root
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
 
 from conclave.core.engine import ConclaveEngine
 from conclave.core.identity import IdentityManager
@@ -52,13 +52,15 @@ class ConclaveOrchestrator:
         return FaceProcessor(self.config.get("processing", {}))
 
     def run_pipeline(self, video_path: str):
-        if not os.path.exists(video_path): return
+        if not os.path.exists(video_path): 
+            logger.error(f"Video not found: {video_path}")
+            return
 
         # --- PHASE 1: AUDIO & DIALOGUE (Pre-computation) ---
         logger.info("=== PHASE 1: AUDIO ANALYSIS ===")
         
         # Extract audio track to temp file
-        audio_path = "temp_full_audio.wav"
+        audio_path = f"temp_full_audio_{self.video_id}.wav"
         self._extract_audio(video_path, audio_path)
         
         # Run SOTA Pipeline
@@ -156,9 +158,12 @@ class ConclaveOrchestrator:
             if episodes:
                 # E. Smart Semantic Ingestion (M3 Style)
                 for mem in episodes:
-                    if isinstance(mem.mem_type, str) and mem.mem_type == "semantic":
-                         self.engine.ingest_semantic_memory(mem)
-                    elif hasattr(mem.mem_type, "value") and mem.mem_type.value == "semantic":
+                    # Robust check for Enum or String
+                    is_semantic = False
+                    if isinstance(mem.mem_type, str) and mem.mem_type == "semantic": is_semantic = True
+                    elif hasattr(mem.mem_type, "value") and mem.mem_type.value == "semantic": is_semantic = True
+                    
+                    if is_semantic:
                          self.engine.ingest_semantic_memory(mem)
                     else:
                          self.engine.add_memory(mem)

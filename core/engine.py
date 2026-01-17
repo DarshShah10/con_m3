@@ -35,53 +35,28 @@ class ConclaveEngine:
         }
 
     def ingest_semantic_memory(self, memory: MemoryNode):
-        """
-        M3-Style Smart Ingestion:
-        Instead of creating duplicates, we REINFORCE existing memories if they are similar.
-        """
-        # 1. Get embedding for the new memory
+        """M3-Style: Reinforce if similar exists, else create."""
         if not memory.embedding:
             memory.embedding = self.embedding_service.get_embeddings_batched([memory.content])[0]
-
-        # 2. Check for existing related memories (The "Systematic" Check)
-        # We look at the primary entity involved
+        
         primary_entity = memory.linked_entities[0] if memory.linked_entities else None
-        
-        should_create_new = True
-        
-        if primary_entity:
-            # Get existing semantic nodes for this entity
-            existing_nodes = self.graph_store.get_connected_semantic_nodes(primary_entity)
-            
-            # Retrieve their vectors to compare (We batch fetch from Qdrant for speed)
-            if existing_nodes:
-                existing_ids = [n['id'] for n in existing_nodes]
-                vectors = self.vector_store.client.retrieve(
-                    collection_name="text_memories",
-                    ids=existing_ids,
-                    with_vectors=True
-                )
-                
-                # Compare Logic
-                for existing_point in vectors:
-                    if not existing_point.vector: continue
-                    
-                    # Cosine Similarity
-                    sim = np.dot(memory.embedding, existing_point.vector)
-                    
-                    if sim > 0.85:
-                        logger.info(f"💪 Reinforcing Memory '{existing_point.payload.get('content')}' (Sim: {sim:.2f})")
-                        # M3 Logic: Reinforce edge weight, don't create new node
-                        self.graph_store.update_edge_weight(existing_point.id, primary_entity, 1.0)
-                        should_create_new = False
-                        break # Found a match, stop looking
-                    elif sim < 0.0:
-                        # Contradiction? Weaken it.
-                        self.graph_store.update_edge_weight(existing_point.id, primary_entity, -0.5)
+        create_new = True
 
-        # 3. Create only if unique
-        if should_create_new:
-            self.add_memory(memory)
+        if primary_entity:
+            nodes = self.graph_store.get_connected_semantic_nodes(primary_entity)
+            if nodes:
+                points = self.vector_store.client.retrieve("text_memories", [n['id'] for n in nodes], with_vectors=True)
+                for p in points:
+                    if not p.vector: continue
+                    sim = np.dot(memory.embedding, p.vector)
+                    if sim > 0.85:
+                        self.graph_store.update_edge_weight(p.id, primary_entity, 1.0)
+                        create_new = False
+                        break
+                    elif sim < 0.0:
+                        self.graph_store.update_edge_weight(p.id, primary_entity, -0.5)
+
+        if create_new: self.add_memory(memory)
 
     def ingest_face(self, obs: FaceObservation):
         """
