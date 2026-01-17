@@ -53,33 +53,31 @@ class VectorStore:
             limit=limit
         )
 
-    def update_point_entity(self, collection: str, point_ids: List[str], new_entity_id: str):
+    def update_point_entity(self, collection: str, old_id: str, new_id: str, video_id: str):
         """
-        Updates the entity_id payload field for a list of points.
-        Used during Identity Merge.
+        Retags all vectors belonging to 'old_id' with 'new_id'.
         """
-        if not point_ids: return
+        # 1. Find points
+        res, _ = self.client.scroll(
+            collection_name=collection,
+            scroll_filter=self._build_filter({"entity_id": old_id, "video_id": video_id}),
+            limit=1000
+        )
         
-        # Set payload for specific points
+        if not res: return
+        
+        points_to_update = [p.id for p in res]
+        
+        # 2. Update payload
         self.client.set_payload(
             collection_name=collection,
-            payload={"entity_id": new_entity_id},
-            points=point_ids
+            payload={"entity_id": new_id},
+            points=points_to_update
         )
 
-    def get_points_by_entity(self, collection: str, entity_id: str, video_id: str) -> List[str]:
-        """
-        Retrieves all point IDs belonging to an entity (for merging).
-        """
-        res = self.client.scroll(
-            collection_name=collection,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="entity_id", match=models.MatchValue(value=entity_id)),
-                    models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id))
-                ]
-            ),
-            limit=1000, # Get a large batch
-            with_payload=False
+    def _build_filter(self, kv_dict):
+        # Helper for filter construction
+        from qdrant_client import models
+        return models.Filter(
+            must=[models.FieldCondition(key=k, match=models.MatchValue(value=v)) for k,v in kv_dict.items()]
         )
-        return [p.id for p in res[0]]

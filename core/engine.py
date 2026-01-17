@@ -3,7 +3,7 @@ import json
 from typing import List, Dict, Any, Optional
 from qdrant_client import models
 from conclave.core.schemas import (
-    FaceObservation, VoiceObservation, VisualObservation, 
+    FaceObservation, VoiceObservation, 
     MemoryNode, MemoryType, EntityType
 )
 from conclave.core.vector_store import VectorStore
@@ -161,3 +161,43 @@ class ConclaveEngine:
             })
             
         return results
+
+    def ingest_dialogue_event(self, video_id: str, clip_id: int, entity_id: str, text: str, ts_ms: int):
+        """
+        Handles full lifecycle of a spoken line:
+        1. Clean Text
+        2. Embed Text (Semantic)
+        3. Store in Qdrant (Text Collection)
+        4. Store in Neo4j (Graph Relational)
+        """
+        if not text or len(text) < 2: return
+
+        # 1. Clean Text (Remove quotes, extra spaces)
+        clean_text = text.replace('"', '').replace("'", "").strip()
+        
+        # 2. Embed Text (Semantic Vector)
+        # We reuse the embedding_service defined in __init__
+        text_vector = self.embedding_service.get_embeddings_batched([clean_text])[0]
+        
+        # 3. Store in Qdrant 'text_memories'
+        # We tag it as type='dialogue' so we can filter later
+        mem_id = f"dial_{video_id}_{clip_id}_{ts_ms}"
+        
+        self.vector_store.upsert(
+            "text_memories",
+            mem_id,
+            text_vector,
+            {
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "entity_id": entity_id,
+                "content": clean_text,
+                "type": "dialogue",  # <--- Distinct from 'episodic' or 'semantic'
+                "ts_ms": ts_ms
+            }
+        )
+        
+        # 4. Store in Neo4j
+        self.graph_store.ingest_dialogue(video_id, clip_id, entity_id, clean_text, ts_ms)
+        
+        logger.info(f"🗣️ DIALOGUE: {entity_id} said '{clean_text}' (Saved to Graph+Vec)")

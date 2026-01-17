@@ -7,7 +7,7 @@ import openai
 from conclave.core.schemas import (
     FaceObservation,
     VoiceObservation,
-    VisualObservation,
+    HierarchicalFrameObservation,
     MemoryNode,
     MemoryType,
 )
@@ -99,7 +99,7 @@ class ReasoningAgent:
 
     def _prepare_multimodal_context(
         self,
-        visuals: List[VisualObservation],
+        visuals: List[HierarchicalFrameObservation],
         faces: List[FaceObservation],
         voices: List[VoiceObservation],
     ) -> str:
@@ -111,11 +111,18 @@ class ReasoningAgent:
 
         # Visuals
         for v in visuals:
-            spatial = getattr(v, "spatial_metadata", {}) or {}
-            desc = spatial.get("dense_description", "No description")
-            ocr = ", ".join(t["text"] for t in v.ocr_tokens) if v.ocr_tokens else ""
+            desc = v.scene_description or "No description"
+            
+            # Aggregate text from all objects
+            text_context = []
+            for obj in v.objects:
+                for txt in obj.linked_text:
+                    text_context.append(f"{obj.label}: '{txt.content}'")
+            
+            ocr_str = ", ".join(text_context)
+            
             blocks.append(
-                f"[{v.ts_ms}ms] Visual: {desc}. Text: [{ocr}]"
+                f"[{v.ts_ms}ms] Visual: {desc}. Text: [{ocr_str}]"
             )
 
         # Aggregate by entity
@@ -148,7 +155,7 @@ class ReasoningAgent:
         self,
         video_id: str,
         clip_id: int,
-        visuals: List[VisualObservation],
+        visuals: List[HierarchicalFrameObservation],
         faces: List[FaceObservation],
         voices: List[VoiceObservation],
     ) -> List[MemoryNode]:

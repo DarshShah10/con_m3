@@ -1,8 +1,10 @@
-import logging
 import queue
+import logging
 import threading
+import uuid
 from typing import List, Dict, Any
 from neo4j import GraphDatabase
+from conclave.core.schemas import HierarchicalFrameObservation, DialogueLine
 
 logger = logging.getLogger("Conclave.GraphStore")
 
@@ -25,10 +27,6 @@ class GraphStore:
         self.driver.close()
 
     def _async_worker(self):
-        """
-        Background thread that consumes write tasks.
-        This allows the GPU to keep processing while we talk to the database.
-        """
         while True:
             task = self.write_queue.get()
             if task is None:
@@ -39,8 +37,22 @@ class GraphStore:
             try:
                 with self.driver.session() as session:
                     session.run(query, params)
+                
+                # 🔥 LOGGING ADDED HERE
+                # We interpret the query intent for nicer logs
+                if "[:HAS_TEXT]" in query:
+                    logger.info(f"🔹 GRAPH: Linked Text to Object")
+                elif "[:SPOKE]" in query:
+                    speaker = params.get('entity_id', 'Unknown')
+                    logger.info(f"🔹 GRAPH: Speaker {speaker} -> Dialogue Stored")
+                elif "pov_user" in query:
+                    logger.info(f"🔹 GRAPH: Updated POV User Status")
+                # General fallback for other queries (uncomment if you want to see EVERYTHING)
+                # else:
+                #    logger.info(f"🔹 GRAPH: Executed Query")
+
             except Exception as e:
-                logger.error(f"Async Graph Write Failed: {e}")
+                logger.error(f"❌ Graph Write Failed: {e}\nQuery: {query}")
             finally:
                 self.write_queue.task_done()
 
@@ -128,4 +140,59 @@ class GraphStore:
         self.write_queue.put((query, {
             "entity_id": entity_id, "clip_id": clip_id, 
             "video_id": video_id, "ts_ms": ts_ms, "obs_id": obs_id
+        }))
+
+    def ingest_hierarchical_obs(self, obs):
+        # 1. Frame Node
+        q_frame = """
+        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
+        MERGE (f:Frame {id: $frame_id})
+        SET f.ts = $ts, f.desc = $desc
+        MERGE (c)-[:HAS_FRAME]->(f)
+        """
+        self.write_queue.put((q_frame, {
+            "clip_id": obs.clip_id, "video_id": obs.video_id, 
+            "frame_id": f"{obs.video_id}_{obs.ts_ms}", 
+            "ts": obs.ts_ms, "desc": obs.scene_description or ""
+        }))
+
+        # 2. Objects and their Texts
+        for obj in obs.objects:
+            obj_uuid = f"{obs.video_id}_obj_{uuid.uuid4().hex[:8]}"
+            
+            q_obj = """
+            MATCH (f:Frame {id: $frame_id})
+            CREATE (o:Object {id: $obj_uuid, label: $label, conf: $conf})
+            MERGE (f)-[:CONTAINS]->(o)
+            """
+            self.write_queue.put((q_obj, {
+                "frame_id": f"{obs.video_id}_{obs.ts_ms}",
+                "obj_uuid": obj_uuid, "label": obj.label, "conf": obj.confidence
+            }))
+
+            # 🔥 LINK THE TEXT TO THE OBJECT
+            for text_item in obj.linked_text:
+                q_text = """
+                MATCH (o:Object {id: $obj_uuid})
+                CREATE (t:Text {content: $content})
+                MERGE (o)-[:HAS_TEXT]->(t)
+                """
+                self.write_queue.put((q_text, {
+                    "obj_uuid": obj_uuid, "content": text_item.content
+                }))
+
+    def ingest_dialogue(self, video_id: str, clip_id: int, entity_id: str, text: str, ts_ms: int):
+        """
+        🔥 NEW: Explicitly links dialogue to the speaker in the Graph
+        """
+        query = """
+        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
+        MATCH (e:Entity {id: $entity_id})
+        CREATE (d:Dialogue {content: $text, ts: $ts})
+        MERGE (e)-[:SPOKE]->(d)
+        MERGE (d)-[:OCCURRED_IN]->(c)
+        """
+        self.write_queue.put((query, {
+            "clip_id": clip_id, "video_id": video_id, 
+            "entity_id": entity_id, "text": text, "ts": ts_ms
         }))

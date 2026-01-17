@@ -11,119 +11,113 @@ from ultralytics import YOLO
 from transformers import SiglipVisionModel, SiglipProcessor
 import easyocr
 import openai
-from core.schemas import VisualObservation
+from conclave.core.schemas import HierarchicalFrameObservation, DetectedObject, LinkedText
 
 logger = logging.getLogger("Conclave.Vision.Scene")
 
-class SceneProcessor:
+class AdvancedSceneProcessor:
     def __init__(self, config: Dict[str, Any]):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-        # 1. SETUP GEMINI API
+        # 1. Gemini API Setup
         gemini_conf = config.get("gemini", {})
-        api_key = gemini_conf.get("api_key")
-        base_url = gemini_conf.get("base_url")
-        model = gemini_conf.get("model", "gemini-2.5-flash-lite-preview-02-05")
-
+        self.api_key = gemini_conf.get("api_key")
+        self.base_url = gemini_conf.get("base_url")
         self.client = None
-        self.vlm_model_name = model
-        
-        if api_key and base_url:
-            logger.info(f"🌐 Connecting to Gemini API: {model}")
+        if self.api_key:
+            logger.info("🌐 Connecting to Gemini...")
             self.client = openai.OpenAI(
-                base_url=base_url,
-                api_key=api_key,
-                timeout=10.0,
-                max_retries=1  # Gemini is usually stable, 1 retry is okay
+                base_url=self.base_url, api_key=self.api_key, timeout=10.0, max_retries=1
             )
-        else:
-            logger.warning("⚠️ Gemini API credentials missing. Captions will be skipped.")
-        
-        # Logic: Caption every 3rd frame (Every ~3 seconds at 1FPS)
-        self.caption_interval = 3
-        
-        logger.info(f"⚡ Loading Lightweight Stack (YOLO + SigLIP) on {self.device}...")
 
-        # 2. SIGLIP (Embeddings) - Keep on GPU
+        # 2. YOLO (Object Detection)
+        self.yolo = YOLO("yolo11s.pt")
+        # Warmup to prevent CUDA errors
+        if self.device.type == 'cuda':
+            self.yolo(np.zeros((640,640,3), dtype=np.uint8), verbose=False, device=self.device)
+        
+        # 3. EasyOCR (Text Reading)
+        self.ocr = easyocr.Reader(['en'], gpu=(self.device.type == 'cuda'), verbose=False)
+        
+        # 4. SigLIP (Embeddings)
         self.siglip_model = SiglipVisionModel.from_pretrained("google/siglip-base-patch16-224").to(self.device, dtype=self.torch_dtype).eval()
         self.siglip_processor = SiglipProcessor.from_pretrained("google/siglip-base-patch16-224")
+
+    def _enhance_for_ocr(self, img_crop: np.ndarray) -> np.ndarray:
+        if img_crop.size == 0: return img_crop
+        gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+
+    def _process_single_frame(self, frame: np.ndarray, ts: int) -> HierarchicalFrameObservation:
+        obs = HierarchicalFrameObservation(video_id="", clip_id=0, ts_ms=ts)
         
-        # 3. OCR (Local)
-        self.ocr_reader = easyocr.Reader(['en'], gpu=(self.device.type == 'cuda'), verbose=False)
+        # A. Detect Objects
+        results = self.yolo(frame, verbose=False, device=self.device)[0]
+        h_frame, w_frame = frame.shape[:2]
 
-        # 4. YOLO (Local) - With Warmup
-        self.yolo_model = YOLO("yolo11s.pt")
-        if self.device.type == 'cuda':
-            # Run dummy inference to initialize CUDA context to prevent asserts later
-            try:
-                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-                self.yolo_model(dummy, verbose=False, device=self.device)
-            except Exception as e:
-                logger.warning(f"YOLO Warmup warning: {e}")
+        for box in results.boxes:
+            conf = float(box.conf)
+            if conf < 0.5: continue
+            
+            label = results.names[int(box.cls)]
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-    def _encode_image(self, image_np: np.ndarray) -> str:
-        h, w = image_np.shape[:2]
-        # Resize if too big (speed optimization for API upload)
-        if max(h, w) > 512:
-            scale = 512 / max(h, w)
-            image_np = cv2.resize(image_np, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        
-        _, buffer = cv2.imencode('.jpg', image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        return base64.b64encode(buffer).decode('utf-8')
+            detected_obj = DetectedObject(label=label, confidence=conf, bbox=[x1, y1, x2, y2])
 
-    def _get_caption_gemini(self, img: np.ndarray) -> str:
-        if not self.client: return "No API Key"
+            # B. Hierarchical Logic: If object is big enough, scan for text
+            obj_w = x2 - x1
+            obj_h = y2 - y1
+            
+            if obj_w > 50 and obj_h > 20:
+                pad_x, pad_y = int(obj_w * 0.05), int(obj_h * 0.05)
+                crop_x1 = max(0, x1 - pad_x)
+                crop_y1 = max(0, y1 - pad_y)
+                crop_x2 = min(w_frame, x2 + pad_x)
+                crop_y2 = min(h_frame, y2 + pad_y)
+                
+                raw_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                clean_crop = self._enhance_for_ocr(raw_crop)
+                
+                try:
+                    ocr_results = self.ocr.readtext(clean_crop, detail=1)
+                    for (bbox, text, ocr_conf) in ocr_results:
+                        if ocr_conf > 0.4 and len(text.strip()) > 1:
+                            detected_obj.linked_text.append(LinkedText(
+                                content=text, confidence=float(ocr_conf), bbox_relative=bbox
+                            ))
+                except: pass
+
+            obs.objects.append(detected_obj)
+        return obs
+
+    def _get_gemini_description(self, img: np.ndarray) -> str:
+        if not self.client: return None
         try:
-            b64 = self._encode_image(img)
+            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            b64 = base64.b64encode(buffer).decode('utf-8')
             resp = self.client.chat.completions.create(
-                model=self.vlm_model_name,
-                messages=[{
-                    "role": "user", 
-                    "content": [
-                        {"type": "text", "text": "Describe this scene concisely in one sentence."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]
-                }],
+                model="gemini-2.0-flash-lite-preview-02-05",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "Describe the scene concisely."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]}],
                 max_tokens=60
             )
             if resp.choices:
                 content = resp.choices[0].message.content
-                # 🔥 ADD THIS TO SEE THE CAPTION
-                logger.info(f"👀 GEMINI CAPTION: {content}")
+                logger.info(f"👀 GEMINI: {content}")
                 return content
-            return "No description."
         except Exception as e:
             logger.warning(f"Gemini API Error: {e}")
-            return "Visual processing skipped."
+        return None
 
-    def process_batch(self, frames_np: List[np.ndarray], video_id: str, clip_id: int, start_ts: int, interval_ms: int):
-        if not frames_np: return []
-
-        # --- 1. SANITIZE INPUTS ---
-        # Filter out corrupted frames (0-byte) to prevent CUDA crashes
-        valid_frames = []
-        valid_indices = []
-        for idx, f in enumerate(frames_np):
-            if f is not None and f.size > 0 and f.shape[0] > 10 and f.shape[1] > 10:
-                valid_frames.append(f)
-                valid_indices.append(idx)
+    def process_batch(self, frames: List[np.ndarray], video_id: str, clip_id: int, start_ms: int, interval_ms: int):
+        observations = []
+        pil_imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
         
-        if not valid_frames:
-            return []
-
-        # --- 2. API CALLS (Parallel) ---
-        # Pick keyframes (0, 3, 6...)
-        key_imgs = [valid_frames[i] for i in range(0, len(valid_frames), self.caption_interval)]
-        
-        # Use ThreadPool to send requests to Google while GPU is busy
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            key_captions = list(pool.map(self._get_caption_gemini, key_imgs))
-
-        # --- 3. LOCAL GPU WORK (YOLO + SigLIP) ---
-        pil_imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in valid_frames]
-        
-        # Batch SigLIP
+        # 1. Batch Embeddings
         with torch.no_grad():
             inputs = self.siglip_processor(images=pil_imgs, return_tensors="pt").to(self.device, dtype=self.torch_dtype)
             out = self.siglip_model(**inputs)
@@ -131,32 +125,18 @@ class SceneProcessor:
             norms = torch.linalg.norm(embeds, ord=2, dim=1, keepdim=True)
             visual_vecs = (embeds / (norms + 1e-6)).tolist()
 
-        # Batch YOLO
-        try:
-            yolo_results = self.yolo_model(valid_frames, verbose=False, stream=False, device=self.device)
-        except Exception as e:
-            logger.error(f"YOLO Batch Failed: {e}")
-            yolo_results = [None] * len(valid_frames)
+        # 2. Logic Loop (2 FPS)
+        for i, frame in enumerate(frames):
+            ts = start_ms + (i * interval_ms)
+            obs = self._process_single_frame(frame, ts)
+            obs.video_id = video_id
+            obs.clip_id = clip_id
+            obs.clip_embedding = visual_vecs[i]
 
-        # --- 4. AGGREGATE ---
-        final_obs = []
-        for i, original_idx in enumerate(valid_indices):
-            # Map back to caption
-            key_idx = min(i // self.caption_interval, len(key_captions) - 1)
-            caption = key_captions[key_idx] if key_captions else "Scene"
+            # 3. Scene Description (Every 4th frame -> 2 seconds)
+            if i % 4 == 0:
+                obs.scene_description = self._get_gemini_description(frame)
             
-            # Extract Objects
-            objects = []
-            if yolo_results[i] is not None:
-                y_res = yolo_results[i]
-                img_area = y_res.orig_shape[0] * y_res.orig_shape[1]
-                objects = [y_res.names[int(b.cls)] for b in y_res.boxes if ((b.xywh[0][2]*b.xywh[0][3])/img_area) > 0.01]
-
-            obs = VisualObservation(
-                video_id=video_id, clip_id=clip_id, ts_ms=start_ts + (original_idx * interval_ms),
-                clip_embedding=visual_vecs[i], ocr_tokens=[], detected_objects=[caption] + objects
-            )
-            obs.__dict__['spatial_metadata'] = {"dense_description": caption}
-            final_obs.append(obs)
-
-        return final_obs
+            observations.append(obs)
+            
+        return observations
