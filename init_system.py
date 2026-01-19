@@ -14,11 +14,13 @@ def init_conclave():
         "text_memories": 3072,   # text-embedding-3-large
         "face_memories": 512,    # InceptionResnetV1 (Facenet)
         "voice_memories": 192,   # SpeechBrain ECAPA-TDNN
-        "visual_memories": 768   # SigLIP-base
+        
+        # 🔥 UPDATED: Changed from 768 -> 3072 to match OpenAI Embeddings
+        "visual_memories": 3072  
     }
 
     for name, size in collections.items():
-        print(f"[*] Checking Qdrant collection: {name} (dim: {size})")
+        print(f"[*] Recreating Qdrant collection: {name} (dim: {size})")
         
         # Recreate collection to ensure clean state
         qc.recreate_collection(
@@ -26,14 +28,16 @@ def init_conclave():
             vectors_config=models.VectorParams(size=size, distance=models.Distance.COSINE)
         )
         
-        # --- 🔥 CRITICAL INDEXES ---
-        # 1. Video ID (for filtering by session)
+        # --- CRITICAL INDEXES ---
         qc.create_payload_index(name, "video_id", models.PayloadSchemaType.KEYWORD)
         
-        # 2. Entity ID (for Identity Merging) <-- THIS WAS MISSING
         if name in ["face_memories", "voice_memories"]:
             qc.create_payload_index(name, "entity_id", models.PayloadSchemaType.KEYWORD)
             
+        # Add 'type' index for text memories as seen in previous errors
+        if name == "text_memories":
+            qc.create_payload_index(name, "type", models.PayloadSchemaType.KEYWORD)
+
         print(f"    -> Created indexes for {name}")
 
     # 2. Initialize Neo4j Constraints
@@ -41,11 +45,9 @@ def init_conclave():
     driver = GraphDatabase.driver(conf["neo4j"]["uri"], auth=(conf["neo4j"]["user"], conf["neo4j"]["password"]))
     
     with driver.session() as session:
-        # Unique IDs for Entities, Memories, and Videos
         session.run("CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
         session.run("CREATE CONSTRAINT memory_id_unique IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE")
         session.run("CREATE CONSTRAINT video_id_unique IF NOT EXISTS FOR (v:Video) REQUIRE v.id IS UNIQUE")
-        # Indexing for Clip lookups
         session.run("CREATE INDEX clip_lookup IF NOT EXISTS FOR (c:Clip) ON (c.id, c.video_id)")
 
     driver.close()

@@ -1,17 +1,40 @@
 import os
 import sys
+
+# --- 🚀 CRITICAL PERFORMANCE OPTIMIZATIONS (MUST BE FIRST) ---
+# 1. Force ONNX/TensorRT to be lazy or skip hardware scans on WSL2
+os.environ["ORT_TENSORRT_ENGINE_CACHE_ENABLE"] = "1" 
+os.environ["ORT_TENSORRT_CACHE_PATH"] = "/tmp/ort_cache"
+os.environ["ORT_CUDA_UNAVAILABLE_AS_FAILURE"] = "1" 
+
+# 2. Force PyTorch/CUDA to load lazily
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+
+# 3. Stop CTranslate2/Whisper verbose logging
+os.environ["CT2_VERBOSE"] = "0"
+
+# 4. Limit CPU thread contention
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+# -----------------------------------------------------------
+
 import json
 import logging
 import argparse
 import cv2
 import ffmpeg
+import gc
+import torch
 
-# Add parent directory to path so 'conclave' package can be found
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Add parent directory to path
+project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
+    
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 
 from conclave.core.engine import ConclaveEngine
 from conclave.core.identity import IdentityManager
@@ -29,12 +52,15 @@ class ConclaveOrchestrator:
         with open(config_path, "r") as f: self.config = json.load(f)
         self.video_id = video_id
         
-        # 1. Engine & Data
         self.engine = ConclaveEngine(video_id=video_id, config_path=config_path)
-        self.identity_manager = IdentityManager(self.engine.vector_store, self.engine.graph_store, self.config.get("processing", {}))
+        self.identity_manager = IdentityManager(
+            self.engine.vector_store, 
+            self.engine.graph_store, 
+            self.config.get("processing", {})
+        )
         self.reasoning_agent = ReasoningAgent(self.config.get("api", {}))
 
-        # 2. Processors
+        logger.info("🔌 Loading Perception Models...")
         self.audio_pipeline = self._load_audio()
         self.scene_proc = self._load_scene()
         self.face_proc = self._load_face()
@@ -56,47 +82,40 @@ class ConclaveOrchestrator:
             logger.error(f"Video not found: {video_path}")
             return
 
-        # --- PHASE 1: AUDIO & DIALOGUE (Pre-computation) ---
+        # =========================================================================
+        # PHASE 1: GLOBAL AUDIO ANALYSIS
+        # =========================================================================
         logger.info("=== PHASE 1: AUDIO ANALYSIS ===")
-        
-        # Extract audio track to temp file
         audio_path = f"temp_full_audio_{self.video_id}.wav"
         self._extract_audio(video_path, audio_path)
         
-        # Run SOTA Pipeline
         audio_data = self.audio_pipeline.process_full_video(audio_path, self.video_id)
         
-        # Resolve Identities immediately (Map SPEAKER_01 -> ent_voice_7d8s)
-        speaker_map = {} # { 'SPEAKER_01': 'ent_voice_real_id' }
-        
+        speaker_map = {} 
         for raw_spk, embedding in audio_data["embeddings"].items():
-            # Create a dummy observation to utilize IdentityManager logic
             dummy_obs = VoiceObservation(
                 video_id=self.video_id, clip_id=-1, ts_ms=0,
                 embedding=embedding, asr_text="", start_sec=0, end_sec=0
             )
             canonical_id = self.identity_manager.resolve_voice(dummy_obs)
-            # Register it strictly so we know this embedding belongs to this ID
             dummy_obs.entity_id = canonical_id
             self.identity_manager.register_observation(dummy_obs)
-            
             speaker_map[raw_spk] = canonical_id
             logger.info(f"🔗 Mapped {raw_spk} -> {canonical_id}")
 
-        # Ingest Dialogue into Graph/Vector Store
         dialogue_timeline = audio_data["timeline"]
         for line in dialogue_timeline:
-            # Swap temp ID for real ID
             real_id = speaker_map.get(line.entity_id, "UNKNOWN_SPEAKER")
             line.entity_id = real_id
-            
             self.engine.ingest_dialogue_event(
                 self.video_id, line.clip_id, real_id, line.text, line.start_ts
             )
 
         if os.path.exists(audio_path): os.remove(audio_path)
 
-        # --- PHASE 2: VISUALS & REASONING (Streaming) ---
+        # =========================================================================
+        # PHASE 2: VISUALS & REASONING
+        # =========================================================================
         logger.info("=== PHASE 2: VISUAL ANALYSIS ===")
         
         chunk_size = 30.0
@@ -107,92 +126,102 @@ class ConclaveOrchestrator:
         while curr < duration:
             logger.info(f"🎞️ Processing Clip {clip_idx} ({curr:.1f}s - {curr+chunk_size:.1f}s)")
             
-            # 1. Extract Frames
+            # 1. Frames
             clip_data = self._extract_frames(video_path, curr, chunk_size)
             if not clip_data: break
             
-            # 2. Visual Perception
+            # 2. Scene (Gemini)
             hierarchical_obs = self.scene_proc.process_batch(
                 clip_data, self.video_id, clip_idx, int(curr*1000), 500
             )
             
-            # 3. Face Perception
+            # 3. Faces
             faces = self.face_proc.extract_from_frames(clip_data[::2], self.video_id, clip_idx)
             for f in faces:
                 self.identity_manager.resolve_face(f)
                 self.identity_manager.register_observation(f)
 
-            # 4. Ingest Visuals
+            # 4. Ingest Visuals (FIX: Generate Embedding for Scene Description)
             for obs in hierarchical_obs:
                 self.engine.graph_store.ingest_hierarchical_obs(obs)
+                
                 if obs.scene_description:
+                    # 🔥 FIX: Generate embedding from text description
+                    # Since Gemini returns text, we need to vectorize it for Qdrant
+                    vec = self.engine.embedding_service.get_embeddings_batched([obs.scene_description])[0]
+                    
                     self.engine.vector_store.upsert(
-                        "visual_memories", obs.obs_id, obs.clip_embedding,
+                        "visual_memories", obs.obs_id, vec,
                         {"video_id": self.video_id, "clip_id": clip_idx, "desc": obs.scene_description}
                     )
 
-            # 5. Retrieve Dialogue Context for this specific clip
-            # We filter the global timeline for lines occurring NOW
+            # 5. Dialogue Context
             clip_start_ms = int(curr * 1000)
             clip_end_ms = int((curr + chunk_size) * 1000)
-            
-            # Create Mock Voice Observations from the timeline for the Agent
             current_voices = []
             for line in dialogue_timeline:
-                # Check overlap
                 if not (line.end_ts < clip_start_ms or line.start_ts > clip_end_ms):
                     current_voices.append(VoiceObservation(
                         video_id=self.video_id, clip_id=clip_idx, ts_ms=line.start_ts,
-                        embedding=[], # Not needed, identity already resolved
+                        embedding=[], 
                         asr_text=line.text, start_sec=line.start_ts/1000, end_sec=line.end_ts/1000,
                         entity_id=line.entity_id
                     ))
 
-            # 6. Flush & Reason
             self.engine.graph_store.flush()
             
+            # 7. Reasoning
             episodes = self.reasoning_agent.generate_episodic_memory(
                 self.video_id, clip_idx, hierarchical_obs, faces, current_voices
             )
             
             if episodes:
-                # E. Smart Semantic Ingestion (M3 Style)
                 for mem in episodes:
-                    # Robust check for Enum or String
                     is_semantic = False
-                    if isinstance(mem.mem_type, str) and mem.mem_type == "semantic": is_semantic = True
-                    elif hasattr(mem.mem_type, "value") and mem.mem_type.value == "semantic": is_semantic = True
+                    if hasattr(mem.mem_type, "value") and mem.mem_type.value == "semantic": is_semantic = True
+                    elif isinstance(mem.mem_type, str) and mem.mem_type == "semantic": is_semantic = True
                     
                     if is_semantic:
                          self.engine.ingest_semantic_memory(mem)
                     else:
                          self.engine.add_memory(mem)
 
-            # F. Logic-Based Identity Merging (M3 Equivalence)
+            # 8. Equivalence Logic
             try:
                 merges = self.reasoning_agent.detect_equivalences(
                     self.video_id, clip_idx, 
                     self.reasoning_agent._prepare_multimodal_context(hierarchical_obs, faces, [])
                 )
-                
                 for m in merges:
                     logger.info(f"🔗 Agent Deducted Identity Merge: {m['source']} == {m['target']}")
-                    self.identity_manager._merge_entities_safe(
-                        keep_id=m['source'], 
-                        drop_id=m['target'], 
-                        video_id=self.video_id
-                    )
+                    self.identity_manager._merge_entities_safe(m['source'], m['target'], self.video_id)
+                
+                # POV Detection (Every 10 clips)
+                if clip_idx > 0 and clip_idx % 10 == 0:
+                    self.identity_manager.detect_pov_operator(self.video_id)
+                    
             except Exception as e:
-                logger.error(f"Error in equivalence detection: {e}")
+                logger.error(f"Identity logic error: {e}")
 
             curr += chunk_size
             clip_idx += 1
+            
+            if clip_idx % 10 == 0:
+                gc.collect()
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        # --- PHASE 3: CONSOLIDATION (The "Sleep" Phase) ---
-        logger.info("=== PHASE 3: SEMANTIC CONSOLIDATION ===")
-        # This mimics M3's memory_processing logic where it clusters nodes
-        count = self.reasoning_agent.consolidate_semantic_memory(self.video_id, self.engine)
-        logger.info(f"✅ Consolidated {count} high-level semantic facts.")
+        # =========================================================================
+        # PHASE 3: DEEP CONSOLIDATION
+        # =========================================================================
+        logger.info("=== PHASE 3: DEEP CONSOLIDATION ===")
+        
+        logger.info("🕵️ Scanning dialogue for names...")
+        names = self.reasoning_agent.extract_names_from_dialogue(self.video_id, self.engine)
+        for entity_id, name in names.items():
+            self.identity_manager.assign_name_to_entity(entity_id, name, self.video_id)
+            
+        logger.info("🧠 Building Semantic Profiles...")
+        self.reasoning_agent.build_semantic_profiles(self.video_id, self.engine)
 
         self.engine.graph_store.close()
         logger.info("✅ Pipeline Complete.")
@@ -212,7 +241,7 @@ class ConclaveOrchestrator:
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        step = max(1, int(fps / 2)) # 2 FPS
+        step = max(1, int(fps / 2)) 
         
         frames = []
         max_frames = int(duration * 2)

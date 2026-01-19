@@ -1,39 +1,39 @@
 import queue
 import logging
 import threading
-import uuid
-from typing import List, Dict, Any
+from typing import Dict, Any
 from neo4j import GraphDatabase
-from conclave.core.schemas import HierarchicalFrameObservation, DialogueLine
 
 logger = logging.getLogger("Conclave.GraphStore")
 
 class GraphStore:
     def __init__(self, config: Dict[str, Any]):
-        self.driver = GraphDatabase.driver(
-            config["uri"], 
-            auth=(config["user"], config["password"])
-        )
+        self.uri = config["uri"]
+        logger.info(f"🔌 Connecting to Neo4j at {self.uri}...")
         
-        # 🚀 ASYNC WRITER SETUP
-        # This queue holds graph queries so the main pipeline never waits for Neo4j
+        try:
+            self.driver = GraphDatabase.driver(
+                config["uri"], 
+                auth=(config["user"], config["password"])
+            )
+            self.driver.verify_connectivity()
+            logger.info("✅ Neo4j Connection Established.")
+        except Exception as e:
+            logger.error(f"❌ Neo4j Connection Failed: {e}")
+            raise e
+            
         self.write_queue = queue.Queue()
-        self.worker_thread = threading.Thread(target=self._async_worker, daemon=True)
-        self.worker_thread.start()
+        self.worker = threading.Thread(target=self._async_worker, daemon=True)
+        self.worker.start()
 
     def close(self):
-        self.flush() # Ensure pending writes are done
+        logger.info("🛑 Closing GraphStore... flushing remaining data.")
+        self.flush()
         self.driver.close()
-        
+
     def flush(self):
-        """
-        BLOCKS until all pending graph writes are finished.
-        Call this before performing complex reasoning or identity merges 
-        that rely on the latest data.
-        """
-        if not self.write_queue.empty():
-            # logger.debug("Waiting for graph writes to flush...")
-            self.write_queue.join()
+        """Blocks until all pending writes are finished."""
+        self.write_queue.join()
 
     def _async_worker(self):
         while True:
@@ -45,172 +45,125 @@ class GraphStore:
             query, params = task
             try:
                 with self.driver.session() as session:
-                    session.run(query, params)
-                
-                # Optional: Reduced logging noise
-                if "[:HAS_TEXT]" in query:
-                    logger.debug(f"🔹 GRAPH: Linked Text")
-                elif "[:SPOKE]" in query:
-                    logger.debug(f"🔹 GRAPH: Dialogue Stored")
-                    
+                    session.execute_write(lambda tx: tx.run(query, params))
             except Exception as e:
-                logger.error(f"❌ Graph Write Failed: {e}")
+                logger.error(f"❌ Graph Write Failed: {e}\nQuery: {query}")
             finally:
                 self.write_queue.task_done()
 
-    def run_query(self, query: str, parameters: Dict[str, Any] = None):
-        """
-        Synchronous Read. Use this when you need data BACK from the graph immediately.
-        (e.g., Checking if an entity exists before resolving identity)
-        """
-        with self.driver.session() as session:
-            return session.run(query, parameters).data()
+    def execute_async(self, q, p=None):
+        self.write_queue.put((q, p))
 
-    def execute_async(self, query: str, parameters: Dict[str, Any] = None):
-        """
-        Public API for arbitrary async writes.
-        Used by IdentityManager for heavy merge operations.
-        """
-        self.write_queue.put((query, parameters))
+    def run_query(self, q, p=None):
+        with self.driver.session() as s:
+            return s.run(q, p).data()
 
-    def merge_entity_nodes(self, source_id: str, target_id: str):
-        """
-        Legacy wrapper for synchronous merge if needed, 
-        but IdentityManager now calls execute_async directly.
-        """
-        # We can implement this as a fallback blocking call or deprecate it.
-        # For safety, we'll implement it blocking in case old code calls it.
-        query = """
-        MATCH (source:Entity {id: $source_id})
-        MATCH (target:Entity {id: $target_id})
-        MATCH (target)-[r]->(x)
-        CALL apoc.refactor.to(r, source) YIELD input, output
-        DETACH DELETE target
-        """
-        try:
-            self.run_query(query, {"source_id": source_id, "target_id": target_id})
-        except:
-            # Fallback query if APOC is missing
-            pass
+    # --- UPDATED METHODS (Using MERGE to fix missing relationships) ---
 
-    # -------------------------------------------------------------------------
-    # NON-BLOCKING WRITE METHODS (Fire & Forget)
-    # -------------------------------------------------------------------------
+    def create_clip_structure(self, video_id, clip_id):
+        # Explicitly create structure
+        q = """
+        MERGE (v:Video {id: $v})
+        MERGE (c:Clip {id: $c, video_id: $v})
+        MERGE (v)-[:HAS_CLIP]->(c)
+        """
+        self.execute_async(q, {"v":video_id, "c":clip_id})
 
-    def create_clip_structure(self, video_id: str, clip_id: int):
-        query = """
+    def create_entity_node(self, eid, etype, vid):
+        q = "MERGE (e:Entity {id: $id}) ON CREATE SET e.type=$t, e.video_id=$v"
+        self.execute_async(q, {"id":eid,"t":etype,"v":vid})
+
+    def create_memory_node(self, mid, con, mtype, vid, cid):
+        # FIX: MERGE Clip first so Memory has something to attach to
+        q = """
+        MERGE (v:Video {id: $v})
+        MERGE (c:Clip {id: $c, video_id: $v})
+        MERGE (v)-[:HAS_CLIP]->(c)
+        
+        MERGE (m:Memory {id: $m}) 
+        ON CREATE SET m.content = $con, m.type = $t 
+        MERGE (c)-[:HAS_MEMORY]->(m)
+        """
+        self.execute_async(q, {"c":cid,"v":vid,"m":mid,"con":con,"t":mtype})
+
+    def link_memory_to_entity(self, mid, eid, rel):
+        # Ensure Entity exists before linking (Safety check)
+        q = f"""
+        MATCH (m:Memory {{id: $m}})
+        MERGE (e:Entity {{id: $e}})
+        MERGE (m)-[:{rel}]->(e)
+        """
+        self.execute_async(q, {"m":mid,"e":eid})
+
+    def ingest_dialogue(self, vid, cid, eid, txt, ts):
+        # FIX: MERGE Clip first
+        q = """
+        MERGE (v:Video {id: $v})
+        MERGE (c:Clip {id: $c, video_id: $v})
+        MERGE (v)-[:HAS_CLIP]->(c)
+        
+        MERGE (e:Entity {id: $e}) 
+        CREATE (d:Dialogue {content: $txt, ts: $ts}) 
+        MERGE (e)-[:SPOKE]->(d)
+        MERGE (d)-[:OCCURRED_IN]->(c)
+        """
+        self.execute_async(q, {"c":cid,"v":vid,"e":eid,"txt":txt,"ts":ts})
+
+    def ingest_hierarchical_obs(self, obs):
+        # FIX: MERGE Clip first
+        q_frame = """
         MERGE (v:Video {id: $video_id})
         MERGE (c:Clip {id: $clip_id, video_id: $video_id})
         MERGE (v)-[:HAS_CLIP]->(c)
-        """
-        self.write_queue.put((query, {"video_id": video_id, "clip_id": clip_id}))
-
-    def create_entity_node(self, entity_id: str, entity_type: str, video_id: str):
-        query = """
-        MERGE (e:Entity {id: $entity_id})
-        ON CREATE SET e.type = $type, e.video_id = $video_id
-        """
-        self.write_queue.put((query, {"entity_id": entity_id, "type": entity_type, "video_id": video_id}))
-
-    def create_memory_node(self, mem_id: str, content: str, mem_type: str, video_id: str, clip_id: int):
-        query = """
-        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
-        MERGE (m:Memory {id: $mem_id})
-        ON CREATE SET m.content = $content, m.type = $mem_type
-        MERGE (c)-[:HAS_MEMORY]->(m)
-        """
-        self.write_queue.put((query, {
-            "mem_id": mem_id, "content": content, "mem_type": mem_type,
-            "video_id": video_id, "clip_id": clip_id
-        }))
-
-    def link_memory_to_entity(self, mem_id: str, entity_id: str, rel_type: str = "MENTIONS"):
-        query = f"""
-        MATCH (m:Memory {{id: $mem_id}})
-        MATCH (e:Entity {{id: $entity_id}})
-        MERGE (m)-[:{rel_type}]->(e)
-        """
-        self.write_queue.put((query, {"mem_id": mem_id, "entity_id": entity_id}))
-
-    def create_appearance_link(self, entity_id: str, clip_id: int, video_id: str, ts_ms: int, obs_id: str):
-        query = """
-        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
-        MATCH (e:Entity {id: $entity_id})
-        MERGE (e)-[r:APPEARED_IN {obs_id: $obs_id}]->(c)
-        ON CREATE SET r.ts_ms = $ts_ms
-        """
-        self.write_queue.put((query, {
-            "entity_id": entity_id, "clip_id": clip_id, 
-            "video_id": video_id, "ts_ms": ts_ms, "obs_id": obs_id
-        }))
-
-    def ingest_hierarchical_obs(self, obs):
-        # 1. Frame Node
-        q_frame = """
-        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
+        
         MERGE (f:Frame {id: $frame_id})
         SET f.ts = $ts, f.desc = $desc
         MERGE (c)-[:HAS_FRAME]->(f)
         """
-        self.write_queue.put((q_frame, {
+        self.execute_async(q_frame, {
             "clip_id": obs.clip_id, "video_id": obs.video_id, 
             "frame_id": f"{obs.video_id}_{obs.ts_ms}", 
             "ts": obs.ts_ms, "desc": obs.scene_description or ""
-        }))
+        })
 
-        # 2. Objects and their Texts
         for obj in obs.objects:
-            obj_uuid = f"{obs.video_id}_obj_{uuid.uuid4().hex[:8]}"
-            
-            q_obj = """
-            MATCH (f:Frame {id: $frame_id})
-            CREATE (o:Object {id: $obj_uuid, label: $label, conf: $conf})
-            MERGE (f)-[:CONTAINS]->(o)
-            """
-            self.write_queue.put((q_obj, {
-                "frame_id": f"{obs.video_id}_{obs.ts_ms}",
-                "obj_uuid": obj_uuid, "label": obj.label, "conf": obj.confidence
-            }))
+            self.ingest_rich_object_attributes(obs.video_id, obs.clip_id, obj.label)
 
-            # 🔥 LINK THE TEXT TO THE OBJECT
-            for text_item in obj.linked_text:
-                q_text = """
-                MATCH (o:Object {id: $obj_uuid})
-                CREATE (t:Text {content: $content})
-                MERGE (o)-[:HAS_TEXT]->(t)
-                """
-                self.write_queue.put((q_text, {
-                    "obj_uuid": obj_uuid, "content": text_item.content
-                }))
+    def ingest_rich_object_attributes(self, video_id: str, clip_id: int, label: str):
+        clean_label = label.split("(")[0].strip()
+        attributes = {}
+        if "(" in label and ")" in label:
+            attr_str = label.split("(")[1].strip(")")
+            parts = attr_str.split(",")
+            for p in parts:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    attributes[k.strip().lower()] = v.strip()
 
-    def ingest_dialogue(self, video_id: str, clip_id: int, entity_id: str, text: str, ts_ms: int):
-        """
-        🔥 NEW: Explicitly links dialogue to the speaker in the Graph
-        """
+        # FIX: MERGE Clip first
         query = """
-        MATCH (c:Clip {id: $clip_id, video_id: $video_id})
-        MATCH (e:Entity {id: $entity_id})
-        CREATE (d:Dialogue {content: $text, ts: $ts})
-        MERGE (e)-[:SPOKE]->(d)
-        MERGE (d)-[:OCCURRED_IN]->(c)
+        MERGE (v:Video {id: $video_id})
+        MERGE (c:Clip {id: $clip_id, video_id: $video_id})
+        MERGE (v)-[:HAS_CLIP]->(c)
+        
+        MERGE (o:Object {label: $label, video_id: $video_id})
+        MERGE (c)-[:CONTAINS]->(o)
+        SET o += $props
         """
-        self.write_queue.put((query, {
+        self.execute_async(query, {
             "clip_id": clip_id, "video_id": video_id, 
-            "entity_id": entity_id, "text": text, "ts": ts_ms
-        }))
+            "label": clean_label, "props": attributes
+        })
+        
+        if "text" in attributes:
+            q_text = """
+            MATCH (o:Object {label: $label, video_id: $video_id})
+            MERGE (t:Text {content: $txt})
+            MERGE (o)-[:HAS_TEXT]->(t)
+            """
+            self.execute_async(q_text, {"label": clean_label, "video_id": video_id, "txt": attributes['text']})
 
     def update_edge_weight(self, source_id, target_id, delta):
         q = """MATCH (a {id: $s})-[r]->(b {id: $t}) 
                SET r.weight = COALESCE(r.weight, 1.0) + $d"""
         self.execute_async(q, {"s": source_id, "t": target_id, "d": delta})
-
-    def get_connected_semantic_nodes(self, entity_id: str):
-        """
-        Retrieves existing semantic memories linked to an entity.
-        Used to check if we should add a new memory or reinforce an old one.
-        """
-        query = """
-        MATCH (e:Entity {id: $entity_id})<-[:MENTIONS]-(m:Memory {type: 'semantic'})
-        RETURN m.id as id, m.content as content
-        """
-        return self.run_query(query, {"entity_id": entity_id})
